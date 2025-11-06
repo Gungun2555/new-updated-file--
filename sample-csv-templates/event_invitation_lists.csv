@@ -1,0 +1,11 @@
+event_name,event_date,invitee_id,invitee_name,email,status
+Cardiology Summit 2025,2025-12-15,HCP001,Dr. Rajesh Kumar,rajesh.kumar@apollo.com,Invited
+Neurology Conference,2025-12-20,HCP002,Dr. Priya Sharma,priya.sharma@fortis.com,Confirmed
+Oncology Workshop,2026-01-10,HCP004,Dr. Sneha Reddy,sneha.reddy@aiims.edu,Invited
+Gastro Symposium,2026-01-25,HCP005,Dr. Vikram Singh,vikram.singh@medanta.com,Pending
+Endocrine Conclave,2026-02-05,HCP006,Dr. Ananya Iyer,ananya.iyer@apollo.com,Confirmed
+Pulmonology Meet,2026-02-15,HCP007,Dr. Rohit Mehta,rohit.mehta@manipal.com,Invited
+Rheumatology Forum,2026-02-28,HCP008,Dr. Kavita Desai,kavita.desai@max.com,Declined
+Nephrology Summit,2026-03-10,HCP009,Dr. Sanjay Gupta,sanjay.gupta@fortis.com,Confirmed
+Dermatology Workshop,2026-03-20,HCP010,Dr. Meera Nair,meera.nair@apollo.com,Invited
+Medical Innovation Expo,2026-04-05,HCP003,Dr. Amit Patel,amit.patel@max.com,Pending

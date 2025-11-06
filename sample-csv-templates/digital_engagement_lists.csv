@@ -1,0 +1,11 @@
+contact_id,contact_name,email,specialty,opt_in
+DG001,Dr. Rajesh Kumar,rajesh.kumar@apollo.com,Cardiology,TRUE
+DG002,Dr. Priya Sharma,priya.sharma@fortis.com,Neurology,TRUE
+DG003,Dr. Amit Patel,amit.patel@max.com,Orthopedics,FALSE
+DG004,Dr. Sneha Reddy,sneha.reddy@aiims.edu,Oncology,TRUE
+DG005,Dr. Vikram Singh,vikram.singh@medanta.com,Gastroenterology,TRUE
+DG006,Dr. Ananya Iyer,ananya.iyer@apollo.com,Endocrinology,TRUE
+DG007,Dr. Rohit Mehta,rohit.mehta@manipal.com,Pulmonology,FALSE
+DG008,Dr. Kavita Desai,kavita.desai@max.com,Rheumatology,TRUE
+DG009,Dr. Sanjay Gupta,sanjay.gupta@fortis.com,Nephrology,TRUE
+DG010,Dr. Meera Nair,meera.nair@apollo.com,Dermatology,FALSE

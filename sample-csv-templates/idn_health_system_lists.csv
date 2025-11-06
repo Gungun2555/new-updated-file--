@@ -1,0 +1,11 @@
+system_id,system_name,contact_name,contact_email,importance
+IDN001,Apollo Hospitals Group,Dr. Ravi Shankar,ravi.shankar@apollo.com,Tier 1
+IDN002,Fortis Healthcare Network,Ms. Priya Mathur,priya.mathur@fortis.com,Tier 1
+IDN003,Max Healthcare System,Mr. Sandeep Gupta,sandeep.gupta@max.com,Tier 2
+IDN004,Medanta Network,Dr. Arvind Kumar,arvind.kumar@medanta.com,Tier 1
+IDN005,Narayana Health Group,Dr. Lakshmi Rao,lakshmi.rao@narayana.com,Tier 2
+IDN006,Manipal Hospitals Chain,Mr. Harish Patel,harish.patel@manipal.com,Tier 2
+IDN007,Columbia Asia Network,Ms. Nisha Iyer,nisha.iyer@columbia.com,Tier 3
+IDN008,HCG Cancer Network,Dr. Ramesh Reddy,ramesh.reddy@hcg.com,Tier 1
+IDN009,Cloudnine Maternity Chain,Ms. Divya Singh,divya.singh@cloudnine.com,Tier 3
+IDN010,KIMS Hospitals Group,Dr. Suresh Babu,suresh.babu@kims.com,Tier 2

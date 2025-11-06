@@ -1,0 +1,11 @@
+contact_id,contact_name,organization,email,influence_level
+FDM001,Dr. Rajiv Malhotra,Max Healthcare,rajiv.malhotra@max.com,High
+FDM002,Dr. Sunita Verma,Apollo Hospitals,sunita.verma@apollo.com,High
+FDM003,Mr. Anil Chopra,Fortis Healthcare,anil.chopra@fortis.com,Medium
+FDM004,Dr. Kiran Patel,Medanta Hospital,kiran.patel@medanta.com,High
+FDM005,Ms. Rekha Nair,AIIMS Delhi,rekha.nair@aiims.edu,High
+FDM006,Dr. Suresh Kumar,Manipal Hospitals,suresh.kumar@manipal.com,Medium
+FDM007,Mr. Prakash Iyer,Narayana Health,prakash.iyer@narayana.com,High
+FDM008,Dr. Geeta Sharma,Columbia Asia,geeta.sharma@columbia.com,Medium
+FDM009,Ms. Anita Rao,HCG Hospitals,anita.rao@hcg.com,High
+FDM010,Dr. Mohan Das,Cloudnine Hospitals,mohan.das@cloudnine.com,Low

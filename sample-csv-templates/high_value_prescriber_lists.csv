@@ -1,0 +1,11 @@
+hcp_id,hcp_name,specialty,territory,total_prescriptions,revenue,value_tier
+HCP001,Dr. Rajesh Kumar,Cardiology,North Delhi,850,125000.50,Platinum
+HCP002,Dr. Priya Sharma,Neurology,South Mumbai,720,98000.75,Gold
+HCP003,Dr. Amit Patel,Orthopedics,East Bangalore,550,72000.00,Gold
+HCP004,Dr. Sneha Reddy,Oncology,West Delhi,920,145000.25,Platinum
+HCP005,Dr. Vikram Singh,Gastroenterology,Central Gurugram,480,65000.00,Silver
+HCP006,Dr. Ananya Iyer,Endocrinology,South Chennai,780,110000.50,Gold
+HCP007,Dr. Rohit Mehta,Pulmonology,North Pune,420,58000.00,Silver
+HCP008,Dr. Kavita Desai,Rheumatology,West Ahmedabad,320,42000.00,Bronze
+HCP009,Dr. Sanjay Gupta,Nephrology,East Kolkata,680,95000.75,Gold
+HCP010,Dr. Meera Nair,Dermatology,South Hyderabad,520,68000.00,Silver

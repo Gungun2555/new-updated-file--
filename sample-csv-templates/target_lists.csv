@@ -1,0 +1,11 @@
+hcp_id,hcp_name,specialty,territory,tier
+HCP001,Dr. Rajesh Kumar,Cardiology,North Delhi,A
+HCP002,Dr. Priya Sharma,Neurology,South Mumbai,A
+HCP003,Dr. Amit Patel,Orthopedics,East Bangalore,B
+HCP004,Dr. Sneha Reddy,Oncology,West Delhi,A
+HCP005,Dr. Vikram Singh,Gastroenterology,Central Gurugram,B
+HCP006,Dr. Ananya Iyer,Endocrinology,South Chennai,A
+HCP007,Dr. Rohit Mehta,Pulmonology,North Pune,B
+HCP008,Dr. Kavita Desai,Rheumatology,West Ahmedabad,C
+HCP009,Dr. Sanjay Gupta,Nephrology,East Kolkata,A
+HCP010,Dr. Meera Nair,Dermatology,South Hyderabad,B

@@ -1,0 +1,11 @@
+hcp_id,hcp_name,specialty,territory,competitor_product,conversion_potential,assigned_rep
+HCP011,Dr. Ramesh Patel,Cardiology,North Delhi,CompetitorX CardioMed,High,Arjun Kapoor
+HCP012,Dr. Lakshmi Menon,Neurology,South Mumbai,CompetitorY NeuroPlus,Medium,Pooja Singh
+HCP013,Dr. Sunil Reddy,Orthopedics,East Bangalore,CompetitorZ BoneCare,High,Ravi Verma
+HCP014,Dr. Anjali Desai,Oncology,West Delhi,CompetitorX OncoMax,High,Neha Agarwal
+HCP015,Dr. Karthik Iyer,Gastroenterology,Central Gurugram,CompetitorY GastroRelief,Low,Rahul Joshi
+HCP016,Dr. Madhavi Rao,Endocrinology,South Chennai,CompetitorZ DiabetoCare,Medium,Simran Kaur
+HCP017,Dr. Naveen Kumar,Pulmonology,North Pune,CompetitorX RespiHealth,High,Karthik Reddy
+HCP018,Dr. Poornima Shah,Rheumatology,West Ahmedabad,CompetitorY JointEase,Medium,Anjali Menon
+HCP019,Dr. Aditya Sharma,Nephrology,East Kolkata,CompetitorZ KidneyGuard,High,Vivek Sharma
+HCP020,Dr. Shalini Nair,Dermatology,South Hyderabad,CompetitorX DermaCure,Low,Deepa Krishnan
