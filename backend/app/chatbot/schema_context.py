@@ -237,6 +237,43 @@ Example:
 SELECT * FROM work_logs WHERE worker_name = 'Priya';
 
 
+----------------------------------------------------------------
+1️⃣3️⃣ document_metadata
+----------------------------------------------------------------
+Purpose:
+Stores metadata about **uploaded documents** used for list management, version
+validation, or AI-based extraction (e.g., PDFs, spreadsheets, notes).
+
+Columns:
+- doc_id → Unique document reference ID
+- uploader_name → Who uploaded the document
+- table_name → Which table this document is related to (e.g., list_versions, call_list_entries)
+- comment → Optional remarks about content it tells about reason of upload 
+- filename, file_type, file_size_bytes → File properties
+- extracted_text_length → Character count of extracted text (if processed)
+- num_chunks → Number of AI chunks extracted for embedding or analysis
+- timestamp → Upload time
+- status → Document state ("processed", "pending", etc.)
+
+When to use:
+- To find all documents uploaded by a specific user
+- To link uploaded documents with particular tables or requests
+- To monitor document ingestion and extraction status
+- To retrieve AI-processed metadata for reporting or re-processing
+
+Example Queries:
+-- Find all processed documents
+SELECT filename, uploader_name, table_name, status
+FROM document_metadata
+WHERE status = 'processed';
+
+-- Find documents uploaded for a specific request or list
+SELECT * FROM document_metadata WHERE table_name = 'list_versions';
+
+-- Get recently uploaded files
+SELECT * FROM document_metadata ORDER BY timestamp DESC LIMIT 10;
+
+
 ================================================================
 👁️ DATABASE VIEWS (Aggregated Insights)
 ================================================================
@@ -314,19 +351,22 @@ SELECT * FROM view_work_attribution WHERE domain_name = 'Oncology';
 - list_requests (1) ──< list_versions
 - list_versions (1) ──< target_list_entries / call_list_entries / competitor_target_entries / others
 - list_requests (1) ──< work_logs
+- document_metadata (n) ──> [various tables like list_versions, call_list_entries]
 
 So:
 → domains organize data hierarchically  
 → list_requests define the *why*  
 → list_versions define the *how it changed*  
 → entries define the *what data*  
-→ work_logs define the *who did what*
+→ work_logs define the *who did what*  
+→ document_metadata defines the *supporting documents for context or AI extraction*
 
 
 ================================================================
 🧩 INTELLIGENT QUERY REASONING HINTS
 ================================================================
 If user asks for:
+- **"Uploaded files", "documents", "PDFs", "metadata"** → use `document_metadata`
 - **"Current list", "latest version", "HCPs"** → use `view_target_list_full`
 - **"Changes", "differences", "what changed"** → use `v_current_state_target_list` or `view_list_evolution`
 - **"Who requested", "purpose", "assigned person"** → use `list_requests` or `view_request_context`
