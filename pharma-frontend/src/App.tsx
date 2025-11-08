@@ -7,6 +7,7 @@ import DomainHistoryPage from './pages/DomainHistoryPage'
 import DomainVersionHistoryPage from './pages/DomainVersionHistoryPage'
 import RequestContextPage from './pages/RequestContextPage'
 import SidebarListBot from './components/SidebarListBot'
+import IngestionHub from './pages/IngestionHub'
 
 export default function App() {
   return (
@@ -28,6 +29,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/ingestion-hub" element={<IngestionHub />} />
             <Route path="/domain/:domainKey" element={<DomainView />} />
             <Route path="/domain/:domainKey/history" element={<DomainHistoryPage />} />
             <Route path="/domain/:domainKey/versions" element={<DomainVersionHistoryPage />} />

@@ -22,7 +22,7 @@ def build_agent_graph():
     graph.add_node("ANALYZE_CHANGES", analyze_changes_node)
     graph.add_node("SUMMARIZE", summarizer_node)
     
-    # ✅ CRITICAL: Add edge from START to ROUTER
+    # ✅ CRITICAL: Add edge from START to ROUTER 
     graph.add_edge(START, "ROUTER")
     
     # Router → Classify
