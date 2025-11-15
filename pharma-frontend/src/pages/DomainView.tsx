@@ -14,7 +14,8 @@ interface Subdomain {
 }
 
 interface SubdomainEntry {
-  entry_id: number
+  entry_id?: number
+  id?: number
   [key: string]: any
 }
 
@@ -41,7 +42,7 @@ export default function DomainView() {
   // Map subdomain names to their corresponding entry table names
   const getEntryTableName = (subdomainName: string): string | null => {
     const tableMapping: Record<string, string> = {
-      'Target Lists': 'target_list_entries',
+      'Target Lists': 'target_list',
       'Call Lists': 'call_list_entries',
       'Formulary Decision-Maker Lists': 'formulary_decision_maker_entries',
       'IDN/Health System Lists': 'idn_health_system_entries',
@@ -51,6 +52,11 @@ export default function DomainView() {
       'Competitor Target Lists': 'competitor_target_entries'
     }
     return tableMapping[subdomainName] || null
+  }
+
+  // ✅ Get the ID field based on table type
+  const getIdFieldName = (tableName: string): string => {
+    return tableName === 'target_list' ? 'id' : 'entry_id'
   }
 
   // Fetch entries function wrapped in useCallback
@@ -85,11 +91,16 @@ export default function DomainView() {
   // Manual refresh function
   const handleRefresh = async () => {
     setIsRefreshing(true)
-    // Reset edit mode and selections on refresh
     setIsEditMode(false)
     setSelectedEntries(new Set())
     await fetchEntries()
     setTimeout(() => setIsRefreshing(false), 500)
+  }
+
+  // ✅ Get unique ID for an entry
+  const getEntryId = (entry: SubdomainEntry, tableName: string): number => {
+    const idField = getIdFieldName(tableName)
+    return entry[idField] as number
   }
 
   // Toggle entry selection
@@ -107,10 +118,13 @@ export default function DomainView() {
 
   // Select all entries
   const handleSelectAll = () => {
+    const tableName = getEntryTableName(selectedSubdomain!.subdomain_name)
+    if (!tableName) return
+
     if (selectedEntries.size === entries.length) {
       setSelectedEntries(new Set())
     } else {
-      setSelectedEntries(new Set(entries.map(e => e.entry_id)))
+      setSelectedEntries(new Set(entries.map(e => getEntryId(e, tableName))))
     }
   }
 
@@ -163,7 +177,6 @@ export default function DomainView() {
       
       try {
         setLoading(true)
-        // Reset edit mode and selections when domain changes
         setIsEditMode(false)
         setSelectedEntries(new Set())
         
@@ -185,7 +198,6 @@ export default function DomainView() {
 
   // Fetch entries when subdomain is selected
   useEffect(() => {
-    // Reset edit mode and selections when subdomain changes
     setIsEditMode(false)
     setSelectedEntries(new Set())
     void fetchEntries()
@@ -194,7 +206,6 @@ export default function DomainView() {
   // Auto-refresh polling every 2 minutes (but pause when user is adding entry)
   useEffect(() => {
     if (isAddingEntry) {
-      // Don't auto-refresh when user is actively adding an entry
       return
     }
 
@@ -242,10 +253,14 @@ export default function DomainView() {
   const getColumnNames = (): string[] => {
     if (!entries || entries.length === 0) return []
     const firstEntry = entries[0]
-    return Object.keys(firstEntry).filter(key => key !== 'entry_id' && key !== 'version_id' && key !== 'created_at')
+    return Object.keys(firstEntry).filter(key => 
+      !['entry_id', 'version_id', 'created_at', 'id'].includes(key)
+    )
   }
 
   const columns = getColumnNames()
+  const tableName = getEntryTableName(selectedSubdomain?.subdomain_name || '')
+  const idFieldName = tableName ? getIdFieldName(tableName) : 'entry_id'
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50/30 to-slate-50">
@@ -302,7 +317,6 @@ export default function DomainView() {
                 onChange={(e) => {
                   const subdomain = subdomains.find(s => s.subdomain_id === Number(e.target.value))
                   setSelectedSubdomain(subdomain || null)
-                  // Reset edit mode and selections when subdomain changes
                   setIsEditMode(false)
                   setSelectedEntries(new Set())
                 }}
@@ -448,25 +462,28 @@ export default function DomainView() {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
-                        {entries.map((entry) => (
-                          <tr key={entry.entry_id} className="hover:bg-slate-50 transition-colors">
-                            {isEditMode && (
-                              <td className="px-4 py-4 w-12">
-                                <input
-                                  type="checkbox"
-                                  checked={selectedEntries.has(entry.entry_id)}
-                                  onChange={() => handleToggleEntry(entry.entry_id)}
-                                  className="w-5 h-5 text-primary border-slate-300 rounded focus:ring-2 focus:ring-primary cursor-pointer"
-                                />
-                              </td>
-                            )}
-                            {columns.map((column) => (
-                              <td key={column} className="px-6 py-4 text-sm text-slate-700">
-                                {entry[column] !== null && entry[column] !== undefined ? String(entry[column]) : '-'}
-                              </td>
-                            ))}
-                          </tr>
-                        ))}
+                        {entries.map((entry) => {
+                          const entryId = getEntryId(entry, tableName || '')
+                          return (
+                            <tr key={entryId} className="hover:bg-slate-50 transition-colors">
+                              {isEditMode && (
+                                <td className="px-4 py-4 w-12">
+                                  <input
+                                    type="checkbox"
+                                    checked={selectedEntries.has(entryId)}
+                                    onChange={() => handleToggleEntry(entryId)}
+                                    className="w-5 h-5 text-primary border-slate-300 rounded focus:ring-2 focus:ring-primary cursor-pointer"
+                                  />
+                                </td>
+                              )}
+                              {columns.map((column) => (
+                                <td key={column} className="px-6 py-4 text-sm text-slate-700">
+                                  {entry[column] !== null && entry[column] !== undefined ? String(entry[column]) : '-'}
+                                </td>
+                              ))}
+                            </tr>
+                          )
+                        })}
                       </tbody>
                     </table>
                   </div>

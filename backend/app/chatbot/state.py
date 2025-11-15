@@ -1,49 +1,42 @@
-from typing import TypedDict, List, Optional, Dict
+"""
+Minimal LangGraph State - Only What's Used
+===========================================
+Stripped to essentials for 3-path routing:
+database_only | vector_store | hybrid
+"""
 
-class Message(TypedDict):
-    """Represents a single message in conversation history"""
-    role: str  # "user" or "assistant"
-    content: str
-    query_type: Optional[str]
+from typing import TypedDict, Optional, List, Dict, Any, Annotated
+import operator
+
 
 class AgentState(TypedDict, total=False):
+    """
+    Minimal state - only fields actually used in nodes
+    """
+    
+    # Input (from user)
     user_query: str
-    request_id: Optional[int]
-    query_type: Optional[str]
-    generated_sql: Optional[str]
-    sql_params: Optional[Dict[str, any]]
-    versions: Optional[List[Dict[str, any]]]
-    comparisons: Optional[List[Dict[str, any]]]
-    most_dynamic: Optional[Dict[str, any]]
-    history_rows: Optional[List[Dict[str, any]]]
-    attribution_rows: Optional[List[Dict[str, any]]]
-    current_version: Optional[Dict[str, any]]
-    rows: Optional[List[Dict[str, any]]]
-    response: Optional[str]
     
-    # 🆕 Enhanced conversation memory
-    conversation_history: List[Message]
-    context_summary: Optional[str]
+    # Routing decision (set by router_node)
+    route: str  # "database_only" | "vector_store" | "hybrid"
     
-    # 🆕 Session context (persistent across turns)
-    session_context: Dict  # {
-                          #   "current_table": str,
-                          #   "last_query_type": str,
-                          #   "active_request_id": int,
-                          #   "last_results_summary": str,
-                          #   "mentioned_tables": [str]
-                          # }
+    # Query classification (set by classify_query_node)
+    query_type: str  # "aggregate", "listing", "detail", "semantic_search", "hybrid_search"
     
-    # 🆕 Memory management
-    session_memory: Dict  # {
-                         #   "conversation_context": str,
-                         #   "query_history": list,
-                         #   "result_cache": dict,
-                         #   "entity_references": dict,
-                         #   "last_topic": str,
-                         #   "turn_count": int
-                         # }
+    # Execution results (populated by execute nodes)
+    results: List[Dict[str, Any]]
     
-    # 🆕 Determine if SQL is needed
-    needs_sql: bool  # If False, respond directly without SQL
-    is_clarification: bool  # If True, user is asking follow-up about previous result
+    # SQL query (if database path)
+    sql: Optional[str]
+    
+    # Final response (set by format_response node)
+    response: str
+    
+    # Memory - conversation history (last 5 turns, append-only)
+    conversation_history: Annotated[List[Dict[str, Any]], operator.add]
+    
+    # Result count (for quick access)
+    results_count: int
+    
+    # Error handling
+    error: Optional[str]

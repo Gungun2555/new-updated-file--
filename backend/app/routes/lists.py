@@ -1,6 +1,7 @@
 """
 Custom Lists Router - Provides high-level list management endpoints
 Maps to list_requests table in Supabase
+Version control for target_list is handled via database triggers
 """
 from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import JSONResponse
@@ -9,6 +10,7 @@ from typing import List, Dict, Any, Optional
 from fastapi import UploadFile, File
 import csv
 from io import StringIO
+import uuid
 
 router = APIRouter(prefix='/lists', tags=['lists'])
 
@@ -33,9 +35,9 @@ def get_lists(category: Optional[str] = None, subdomain_id: Optional[int] = None
         resp = query.limit(limit).order('created_at', desc=True).execute()
         lists = resp.data if hasattr(resp, 'data') else resp
         
-        # Table mapping for subdomain entries
+        # Table mapping for subdomain entries - UPDATED FOR NEW TARGET_LIST SCHEMA
         table_mapping = {
-            'Target Lists': 'target_list_entries',
+            'Target Lists': 'target_list',
             'Call Lists': 'call_list_entries',
             'Formulary Decision-Maker Lists': 'formulary_decision_maker_entries',
             'IDN/Health System Lists': 'idn_health_system_entries',
@@ -58,8 +60,9 @@ def get_lists(category: Optional[str] = None, subdomain_id: Optional[int] = None
                     entry_table = table_mapping.get(subdomain_name)
                     
                     if entry_table:
-                        # Check if there are entries for this version
-                        entries_resp = sb.table(entry_table).select('entry_id', count='exact').eq('version_id', version_resp.data[0]['version_id']).limit(1).execute()
+                        # All tables now check total count
+                        entries_resp = sb.table(entry_table).select('id' if entry_table == 'target_list' else 'entry_id', count='exact').limit(1).execute()
+                        
                         # Only include this list if it has entries
                         if entries_resp.count and entries_resp.count > 0:
                             filtered_lists.append(list_item)
@@ -79,6 +82,7 @@ def get_list_detail(list_id: int):
     """
     Get detailed information for a specific list
     Returns list_request with related data and current snapshot items
+    UPDATED: Handles new target_list schema (no version_id in table)
     """
     sb = _get_supabase()
     try:
@@ -111,38 +115,45 @@ def get_list_detail(list_id: int):
             current_version = version_resp.data[0]
             list_data['current_version'] = current_version
             print(f"[DEBUG GET_LIST_DETAIL] Current version: {current_version['version_number']}, version_id: {current_version['version_id']}")
+        
+        # Get items based on subdomain type
+        if subdomain_name:
+            table_mapping = {
+                'Target Lists': 'target_list',
+                'Call Lists': 'call_list_entries',
+                'Formulary Decision-Maker Lists': 'formulary_decision_maker_entries',
+                'IDN/Health System Lists': 'idn_health_system_entries',
+                'Event Invitation Lists': 'event_invitation_entries',
+                'Digital Engagement Lists': 'digital_engagement_entries',
+                'High-Value Prescriber Lists': 'high_value_prescriber_entries',
+                'Competitor Target Lists': 'competitor_target_entries'
+            }
             
-            # Get items for the current version from the appropriate entry table
-            if subdomain_name:
-                table_mapping = {
-                    'Target Lists': 'target_list_entries',
-                    'Call Lists': 'call_list_entries',
-                    'Formulary Decision-Maker Lists': 'formulary_decision_maker_entries',
-                    'IDN/Health System Lists': 'idn_health_system_entries',
-                    'Event Invitation Lists': 'event_invitation_entries',
-                    'Digital Engagement Lists': 'digital_engagement_entries',
-                    'High-Value Prescriber Lists': 'high_value_prescriber_entries',
-                    'Competitor Target Lists': 'competitor_target_entries'
-                }
-                
-                entry_table = table_mapping.get(subdomain_name)
-                print(f"[DEBUG GET_LIST_DETAIL] Entry table: {entry_table}")
-                
-                if entry_table:
-                    # Get all items for this version
-                    print(f"[DEBUG GET_LIST_DETAIL] Querying {entry_table} for version_id={current_version['version_id']}")
-                    items_resp = sb.table(entry_table).select('*').eq('version_id', current_version['version_id']).execute()
-                    print(f"[DEBUG GET_LIST_DETAIL] Items found: {len(items_resp.data) if items_resp.data else 0}")
-                    
-                    if items_resp.data:
-                        list_data['current_snapshot'] = {
-                            'version_id': current_version['version_id'],
-                            'version_number': current_version['version_number'],
-                            'items': items_resp.data
-                        }
-                        print(f"[DEBUG GET_LIST_DETAIL] Added current_snapshot with {len(items_resp.data)} items")
+            entry_table = table_mapping.get(subdomain_name)
+            print(f"[DEBUG GET_LIST_DETAIL] Entry table: {entry_table}")
+            
+            if entry_table:
+                # For target_list: fetch all records (no version_id filtering)
+                # For old schemas: fetch by version_id
+                if entry_table == 'target_list':
+                    print(f"[DEBUG GET_LIST_DETAIL] Fetching from target_list (no version filtering)")
+                    items_resp = sb.table(entry_table).select('*').execute()
+                else:
+                    if current_version:
+                        print(f"[DEBUG GET_LIST_DETAIL] Querying {entry_table} for version_id={current_version['version_id']}")
+                        items_resp = sb.table(entry_table).select('*').eq('version_id', current_version['version_id']).execute()
                     else:
-                        print(f"[DEBUG GET_LIST_DETAIL] No items found in response")
+                        items_resp = None
+                
+                if items_resp and items_resp.data:
+                    list_data['current_snapshot'] = {
+                        'version_id': current_version['version_id'] if current_version else None,
+                        'version_number': current_version['version_number'] if current_version else 1,
+                        'items': items_resp.data
+                    }
+                    print(f"[DEBUG GET_LIST_DETAIL] Added current_snapshot with {len(items_resp.data)} items")
+                else:
+                    print(f"[DEBUG GET_LIST_DETAIL] No items found in response")
         else:
             print(f"[DEBUG GET_LIST_DETAIL] No version found for this list")
         
@@ -225,16 +236,25 @@ def delete_list(list_id: int):
 @router.post('/{list_id}/items', status_code=status.HTTP_201_CREATED)
 def add_items_to_list(list_id: int, payload: Dict[str, Any]):
     """
-    Add items to a list (creates a new version)
-    Expected payload: { "items": [...], "updated_by": "user_name" }
+    Add items to a list (creates a new version for old schemas)
+    Expected payload: { 
+        "items": [...], 
+        "updated_by": "user_name",
+        "bulk_operation_id": "uuid"  # Optional, tracks bulk uploads
+    }
+    
+    UPDATED: For target_list, version control is handled by database triggers
+    For old schemas, creates a version entry in list_versions
     """
     sb = _get_supabase()
     try:
         items = payload.get('items', [])
         updated_by = payload.get('updated_by', 'Unknown')
+        bulk_operation_id = payload.get('bulk_operation_id', str(uuid.uuid4()))
 
         print(f"[DEBUG] Adding items to list {list_id}")
         print(f"[DEBUG] Number of items: {len(items)}")
+        print(f"[DEBUG] Bulk Operation ID: {bulk_operation_id}")
 
         if not items:
             raise HTTPException(status_code=400, detail='No items provided')
@@ -257,7 +277,7 @@ def add_items_to_list(list_id: int, payload: Dict[str, Any]):
         
         # Map subdomain to entry table
         table_mapping = {
-            'Target Lists': 'target_list_entries',
+            'Target Lists': 'target_list',
             'Call Lists': 'call_list_entries',
             'Formulary Decision-Maker Lists': 'formulary_decision_maker_entries',
             'IDN/Health System Lists': 'idn_health_system_entries',
@@ -273,72 +293,122 @@ def add_items_to_list(list_id: int, payload: Dict[str, Any]):
         
         print(f"[DEBUG] Using entry table: {entry_table}")
 
-        # ✅ Get the latest version for this specific list
-        version_resp = sb.table('list_versions') \
-            .select('version_number') \
-            .eq('request_id', list_id) \
-            .order('version_number', desc=True) \
-            .limit(1) \
-            .execute()
+        # UPDATED: Handle new target_list schema with trigger-based version control
+        if entry_table == 'target_list':
+            # Validate required fields for new schema
+            required_fields = ['full_name']
+            for item in items:
+                if 'full_name' not in item:
+                    raise HTTPException(status_code=400, detail='full_name is required for Target Lists')
+            
+            # Clean up items - only keep valid columns
+            valid_columns = {
+                'hcp_code', 'full_name', 'gender', 'qualification', 'specialty',
+                'designation', 'email', 'phone', 'hospital_name', 'hospital_address',
+                'city', 'state', 'pincode', 'experience_years', 'influence_score',
+                'category', 'therapy_area', 'monthly_sales', 'yearly_sales',
+                'last_interaction_date', 'call_frequency', 'priority'
+            }
+            
+            cleaned_items = []
+            for item in items:
+                cleaned_item = {k: v for k, v in item.items() if k in valid_columns}
+                cleaned_items.append(cleaned_item)
+            
+            print(f"[DEBUG] Inserting {len(cleaned_items)} items into {entry_table}")
+            
+            try:
+                items_resp = sb.table(entry_table).insert(cleaned_items).execute()
+                inserted_count = len(items_resp.data) if hasattr(items_resp, 'data') and items_resp.data else 0
+                
+                print(f"[DEBUG] Successfully inserted {inserted_count} items into {entry_table}")
+                print(f"[DEBUG] Database triggers will handle version history logging")
+                
+                if inserted_count == 0:
+                    raise HTTPException(status_code=500, detail='No items inserted into database')
+                
+                return {
+                    'success': True,
+                    'items_added': inserted_count,
+                    'table_used': entry_table,
+                    'bulk_operation_id': bulk_operation_id,
+                    'note': 'Version tracking handled by database triggers'
+                }
+            
+            except Exception as insert_error:
+                print(f"[ERROR] Insert failed: {insert_error}")
+                raise HTTPException(status_code=400, detail=str(insert_error))
+        
+        else:
+            # Old schemas: use version-based insertion
+            print(f"[DEBUG] Inserting into old schema with version tracking")
+            
+            # Get the latest version for this specific list
+            version_resp = sb.table('list_versions') \
+                .select('version_number') \
+                .eq('request_id', list_id) \
+                .order('version_number', desc=True) \
+                .limit(1) \
+                .execute()
 
-        next_version = 1
-        if version_resp.data and len(version_resp.data) > 0:
-            next_version = version_resp.data[0]['version_number'] + 1
+            next_version = 1
+            if version_resp.data and len(version_resp.data) > 0:
+                next_version = version_resp.data[0]['version_number'] + 1
 
-        print(f"[DEBUG] Creating new version: {next_version}")
+            print(f"[DEBUG] Creating new version: {next_version}")
 
-        # Set all previous versions to is_current=False for this list
-        sb.table('list_versions').update({'is_current': False}).eq('request_id', list_id).execute()
+            # Set all previous versions to is_current=False for this list
+            sb.table('list_versions').update({'is_current': False}).eq('request_id', list_id).execute()
 
-        # ✅ Create a new version record
-        version_data = {
-            'request_id': list_id,
-            'version_number': next_version,
-            'change_type': 'Update',
-            'change_rationale': f'Added {len(items)} items via CSV upload',
-            'created_by': updated_by,
-            'is_current': True
-        }
-        version_insert = sb.table('list_versions').insert(version_data).execute()
+            # Create a new version record
+            version_data = {
+                'request_id': list_id,
+                'version_number': next_version,
+                'change_type': 'Update',
+                'change_rationale': f'Added {len(items)} items via bulk upload',
+                'created_by': updated_by,
+                'is_current': True
+            }
+            version_insert = sb.table('list_versions').insert(version_data).execute()
 
-        if not version_insert.data or len(version_insert.data) == 0:
-            raise HTTPException(status_code=500, detail='Failed to create version')
+            if not version_insert.data or len(version_insert.data) == 0:
+                raise HTTPException(status_code=500, detail='Failed to create version')
 
-        # ✅ FIX: use correct primary key name from list_versions table
-        version_row = version_insert.data[0]
-        version_id = version_row.get('id') or version_row.get('version_id')
+            version_row = version_insert.data[0]
+            version_id = version_row.get('id') or version_row.get('version_id')
 
-        if not version_id:
-            raise HTTPException(status_code=500, detail='Version ID not returned from database')
+            if not version_id:
+                raise HTTPException(status_code=500, detail='Version ID not returned from database')
 
-        print(f"[DEBUG] Created version_id: {version_id}")
+            print(f"[DEBUG] Created version_id: {version_id}")
 
-        # ✅ Add version_id to every item
-        items_with_version = [{**item, 'version_id': version_id} for item in items]
+            # Add version_id to every item
+            items_with_version = [{**item, 'version_id': version_id} for item in items]
 
-        print(f"[DEBUG] Inserting {len(items_with_version)} items into {entry_table}")
+            print(f"[DEBUG] Inserting {len(items_with_version)} items into {entry_table}")
 
-        try:
-            items_resp = sb.table(entry_table).insert(items_with_version).execute()
-        except Exception as insert_error:
-            print(f"[ERROR] Insert failed: {insert_error}")
-            import traceback
-            print(traceback.format_exc())
-            raise HTTPException(status_code=400, detail=str(insert_error))
+            # INSERT all items
+            try:
+                items_resp = sb.table(entry_table).insert(items_with_version).execute()
+            except Exception as insert_error:
+                print(f"[ERROR] Insert failed: {insert_error}")
+                raise HTTPException(status_code=400, detail=str(insert_error))
 
-        inserted_count = len(items_resp.data) if hasattr(items_resp, 'data') and items_resp.data else 0
-        print(f"[DEBUG] Successfully inserted {inserted_count} items into {entry_table}")
+            inserted_count = len(items_resp.data) if hasattr(items_resp, 'data') and items_resp.data else 0
+            
+            print(f"[DEBUG] Successfully inserted {inserted_count} items into {entry_table}")
 
-        if inserted_count == 0:
-            raise HTTPException(status_code=500, detail='No items inserted into database')
+            if inserted_count == 0:
+                raise HTTPException(status_code=500, detail='No items inserted into database')
 
-        return {
-            'success': True,
-            'version_id': version_id,
-            'version_number': next_version,
-            'items_added': inserted_count,
-            'table_used': entry_table
-        }
+            return {
+                'success': True,
+                'version_id': version_id,
+                'version_number': next_version,
+                'items_added': inserted_count,
+                'table_used': entry_table,
+                'bulk_operation_id': bulk_operation_id
+            }
 
     except HTTPException:
         raise
@@ -348,21 +418,18 @@ def add_items_to_list(list_id: int, payload: Dict[str, Any]):
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
-
-
 @router.post('/{list_id}/upload-csv', status_code=status.HTTP_201_CREATED)
 async def upload_csv_to_list(list_id: int, file: UploadFile = File(...), updated_by: str = "CSV Upload"):
     """
     Bulk upload CSV file for a specific list_id
-    Parses CSV → creates items → reuses add_items_to_list() logic
+    Parses CSV → creates items → adds to list
+    UPDATED: Handles new target_list schema
     """
     sb = _get_supabase()
     try:
-        
         if not file.filename.endswith('.csv'):
             raise HTTPException(status_code=400, detail='Only CSV files are supported.')
 
-    
         contents = await file.read()
         csv_text = contents.decode('utf-8')
         reader = csv.DictReader(StringIO(csv_text))
@@ -371,20 +438,21 @@ async def upload_csv_to_list(list_id: int, file: UploadFile = File(...), updated
         if not rows:
             raise HTTPException(status_code=400, detail='CSV file is empty.')
 
+        # Pass through to add_items_to_list with bulk operation ID
+        bulk_op_id = str(uuid.uuid4())
         
         payload = {
             "items": rows,
-            "updated_by": updated_by
+            "updated_by": updated_by,
+            "bulk_operation_id": bulk_op_id
         }
 
-        
         return add_items_to_list(list_id=list_id, payload=payload)
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.get('/domain/{domain_id}/worklogs', response_model=List[Dict[str, Any]])
 def get_work_logs_by_domain(domain_id: int, limit: int = 100):
@@ -434,4 +502,16 @@ def get_versions_by_domain(domain_id: int, limit: int = 100):
         print(f"[ERROR] Exception in get_versions_by_domain: {str(e)}")
         import traceback
         print(f"[ERROR] Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@router.get('/target_list_entries')
+def get_target_list_entries():
+    """
+    Get all target list entries (new schema)
+    """
+    sb = _get_supabase()
+    try:
+        resp = sb.table('target_list').select('*').execute()
+        return resp.data if hasattr(resp, 'data') else resp
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

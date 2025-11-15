@@ -1,13 +1,11 @@
 """
-Complete Agent Nodes with Advanced Memory & Context Management
-================================================================
-Features:
-- Smart clarification detection
-- Session memory with context tracking
-- Conversation summarization for long chats
-- Reference to previous results
-- Multi-turn query understanding
-- Gemini API Integration (replacing OpenAI)
+Advanced Agent Nodes: LLM-Based Routing + Semantic Search with Pinecone
+========================================================================
+UPDATES:
+- Replaced ChromaDB with Pinecone vector database
+- Uses Pinecone for semantic search with embeddings
+- Improved error handling to prevent bot crashes
+- Better response formatting
 """
 
 import os
@@ -16,675 +14,717 @@ import json
 import psycopg2
 import psycopg2.extras
 import google.generativeai as genai
-from .state import AgentState
-from .schema_context import SCHEMA_CONTEXT
 from dotenv import load_dotenv
 from datetime import datetime
+from typing import Optional, Dict, List, Any
+
+from .state import AgentState
+from .schema_context import SCHEMA_CONTEXT
+
+# Pinecone for vector search
+try:
+    from pinecone import Pinecone
+    from sentence_transformers import SentenceTransformer
+    PINECONE_AVAILABLE = True
+except Exception as e:
+    print(f"⚠ Pinecone import error: {e}")
+    PINECONE_AVAILABLE = False
 
 load_dotenv()
 
-# ✅ Configure Gemini API
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel("gemini-2.0-flash")
-
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 
+# Pinecone Setup
+pinecone_index = None
+embedding_model = None
 
-# ═══════════════════════════════════════════════════════════════
-# MEMORY MANAGEMENT UTILITIES
-# ═══════════════════════════════════════════════════════════════
+if PINECONE_AVAILABLE:
+    try:
+        from app.core.pinecone_client import pc, index
+        pinecone_index = index
+        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        print("✅ Pinecone initialized for semantic search")
+    except Exception as e:
+        print(f"⚠ Pinecone initialization error: {e}")
+        PINECONE_AVAILABLE = False
 
-def initialize_memory(state: AgentState) -> AgentState:
-    """Initialize or retrieve session memory"""
-    if not state.get("session_memory"):
-        state["session_memory"] = {
-            "conversation_context": "",
-            "query_history": [],
-            "result_cache": {},
-            "entity_references": {},
-            "last_topic": None,
-            "last_table": None,
-            "turn_count": 0
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def clean_sql(sql_text: str) -> str:
+    """Remove markdown code fences and clean SQL text"""
+    sql_text = re.sub(r"```(?:sql|SQL)?", "", sql_text)
+    sql_text = re.sub(r"```", "", sql_text)
+    return sql_text.strip()
+
+
+def get_conversation_context(state: AgentState) -> str:
+    """Generate context string from conversation history for LLM"""
+    history = state.get("conversation_history", [])
+    
+    if not history:
+        return "No previous context."
+    
+    lines = ["Recent conversation:"]
+    for i, turn in enumerate(history[-3:], 1):
+        query_text = turn.get('query', '')[:80]
+        route_used = turn.get('type', 'unknown')
+        lines.append(f"{i}. User asked: '{query_text}...' → Routed to: {route_used}")
+    
+    return "\n".join(lines)
+
+
+def extract_changes_from_text(text: str) -> Dict[str, Any]:
+    """Extract structured change information from document text using LLM"""
+    prompt = f"""
+    Analyze this document text and extract structured change information:
+    
+    TEXT:
+    {text[:2000]}
+    
+    Extract and return JSON with this exact structure:
+    {{
+        "action": "added|removed|updated|modified|unknown",
+        "items": ["specific item names extracted"],
+        "count": <number of items changed>,
+        "list_name": "name of the list/table/entity affected",
+        "reason": "explanation for why this change was made",
+        "timestamp": "date/time if mentioned, else null"
+    }}
+    
+    Rules:
+    - Return ONLY valid JSON, no markdown, no explanations
+    - If information is not found, use null for that field
+    - Be specific with item names, don't use placeholders
+    - Extract the actual business reason for changes
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        clean_text = response.text.strip()
+        clean_text = clean_text.replace("json", "").replace("```", "").strip()
+        result = json.loads(clean_text)
+        return result
+    except Exception as e:
+        print(f"⚠ Could not extract changes: {e}")
+        return {
+            "action": None,
+            "items": [],
+            "count": 0,
+            "list_name": None,
+            "reason": None,
+            "timestamp": None
         }
-    return state
 
 
-def update_memory(state: AgentState) -> AgentState:
-    """Update session memory after each turn"""
-    state = initialize_memory(state)
-    memory = state.get("session_memory", {})
-    
-    if "query_history" not in memory:
-        memory["query_history"] = []
-    if "result_cache" not in memory:
-        memory["result_cache"] = {}
-    if "entity_references" not in memory:
-        memory["entity_references"] = {}
-    
-    memory["turn_count"] = memory.get("turn_count", 0) + 1
-    
-    query = state.get("user_query", "")
-    sql = state.get("generated_sql")
-    rows = state.get("rows", [])
-    response = state.get("response", "")
-    
-    query_record = {
-        "turn": memory["turn_count"],
-        "query": query,
-        "sql": sql,
-        "row_count": len(rows),
-        "timestamp": datetime.now().isoformat(),
-        "response_summary": response[:200] if response else ""
-    }
-    
-    memory["query_history"].append(query_record)
-    
-    if len(memory["query_history"]) > 10:
-        memory["query_history"] = memory["query_history"][-10:]
-    
-    if sql and rows:
-        cache_key = f"turn_{memory['turn_count']}"
-        memory["result_cache"][cache_key] = {
-            "sql": sql,
-            "rows": rows[:50],
-            "full_count": len(rows)
-        }
-        
-        if 'FROM' in sql.upper():
-            table_match = re.search(r'FROM\s+(\w+)', sql, re.IGNORECASE)
-            if table_match:
-                memory["last_table"] = table_match.group(1)
-                state["session_context"]["current_table"] = table_match.group(1)
-    
-    entities = extract_entities(query, rows)
-    memory["entity_references"].update(entities)
-    
-    if state.get("query_type"):
-        memory["last_topic"] = state["query_type"]
-    
-    if memory["turn_count"] % 3 == 0:
-        memory["conversation_context"] = summarize_conversation_context(memory["query_history"])
-    
-    state["session_memory"] = memory
-    return state
-
-
-def extract_entities(query: str, rows: list) -> dict:
-    """Extract mentioned entities from query and results"""
-    entities = {}
-    
-    tables = ["list_versions", "target_list_entries", "hcp", "version"]
-    for table in tables:
-        if table in query.lower():
-            entities[f"table_{table}"] = True
-    
-    if rows and isinstance(rows[0], dict):
-        for row in rows[:5]:
-            for key, value in row.items():
-                if 'name' in key.lower() and isinstance(value, str):
-                    entities[f"name_{value}"] = True
-    
-    return entities
-
-
-def summarize_conversation_context(query_history: list) -> str:
-    """Generate a summary of recent conversation for context"""
-    if not query_history:
-        return "No previous conversation."
-    
-    recent = query_history[-5:]
-    summary_parts = []
-    
-    for record in recent:
-        summary_parts.append(
-            f"Turn {record['turn']}: Asked about '{record['query'][:60]}...' "
-            f"→ {record['row_count']} results"
-        )
-    
-    return "\n".join(summary_parts)
-
-
-# ═══════════════════════════════════════════════════════════════
-# ROUTER NODE WITH MEMORY AWARENESS
-# ═══════════════════════════════════════════════════════════════
+# =============================================================================
+# LLM-BASED INTELLIGENT ROUTER
+# =============================================================================
 
 def router_node(state: AgentState) -> AgentState:
     """
-    Smart router using memory to understand context and intent.
-    Distinguishes between new queries, clarifications, and follow-ups.
+    LLM-based intelligent routing - NO keyword matching!
+    Uses context and intent understanding to route queries.
     """
-    state = initialize_memory(state)
+    state_copy = dict(state)
+    query = state_copy.get("user_query", "")
+    history = state_copy.get("conversation_history", [])
+    context_str = get_conversation_context(state_copy)
     
-    query = state.get("user_query", "").lower()
-    memory = state.get("session_memory", {})
-    query_history = memory.get("query_history", [])
+    routing_prompt = f"""
+    You are an intelligent query router for a document management system. Analyze the user's query and conversation context to determine the best route.
     
-    if not state.get("session_context"):
-        state["session_context"] = {
-            "current_table": None,
-            "last_query_type": None,
-            "active_request_id": state.get("request_id"),
-            "last_results_summary": "",
-            "mentioned_tables": [],
-            "last_sql_query": None,
-            "last_result_count": 0
-        }
+    CONVERSATION CONTEXT:
+    {context_str}
     
-    new_query_indicators = [
-        "give me", "show me", "retrieve", "fetch", "get me", "find",
-        "i want", "i need", "can you get", "can you show", "list",
-        "another question", "new question", "different question",
-        "from table", "from the", "select", "query", "what are", "what is"
-    ]
+    CURRENT USER QUERY:
+    "{query}"
     
-    clarification_indicators = [
-        "about them", "about these", "about those", "about it", "about that",
-        "the same", "those ones", "these ones", "from that", "from those",
-        "tell me more", "more about", "more details", "more info",
-        "what about", "how about", "why", "explain"
-    ]
+    AVAILABLE ROUTES:
     
-    reference_indicators = [
-        "the results", "the data", "those results", "that list",
-        "the previous", "last query", "before", "earlier"
-    ]
+    1. database_only: Use when user wants to:
+       - Query structured database tables (products, users, orders, etc.)
+       - Get counts, lists, or specific records from tables
+       - Filter or search database records
+       - View metadata (uploader names, file names, timestamps)
+       - Examples: "show all products", "how many users", "list orders by date"
     
-    is_new_query = any(indicator in query for indicator in new_query_indicators)
-    is_clarification = any(indicator in query for indicator in clarification_indicators)
-    has_reference = any(indicator in query for indicator in reference_indicators)
+    2. vector_store: Use when user wants to:
+       - Search INSIDE document content (what documents say/contain)
+       - Understand what changed in documents (additions, removals, updates)
+       - Find why changes were made (reasons, explanations)
+       - Semantic search across document text
+       - Examples: "what was added to the call list", "why was this item removed", "what does the document say about pricing"
     
-    sql_keywords = [
-        "show", "list", "find", "search", "get", "count", "how many",
-        "compare", "difference", "version", "when", "created", "modified",
-        "sql", "query", "table", "data", "record", "entry", "hcp", "all",
-        "retrieve", "fetch", "select", "from", "where", "entries", "what are",
-        "give", "display", "who", "which", "lists", "targets", "requests",
-        "revenue", "tier", "specialty", "address", "phone", "email", "city",
-        "state", "zip", "npi", "prescriber", "value", "total", "sum"
-    ]
-    needs_sql_keywords = any(kw in query for kw in sql_keywords)
+    3. hybrid: Use when user wants to:
+       - Combine WHO uploaded with WHAT content (metadata + content)
+       - Filter documents by uploader AND search their content
+       - Find specific user's documents about a topic
+       - Examples: "show documents uploaded by Aryan about pricing", "what did Gungun add to the target list"
     
-    has_entity_reference = False
-    if memory.get("entity_references"):
-        for entity in memory["entity_references"].keys():
-            if entity.lower() in query:
-                has_entity_reference = True
-                needs_sql_keywords = True
-                break
+    DECISION RULES:
+    - If query references "those", "them", "these", "same" → inherit previous route from context
+    - If query asks about WHO uploaded/modified → consider hybrid (unless only asking for metadata)
+    - If query asks about WHAT is IN documents → use vector_store
+    - If query asks for database records/counts → use database_only
+    - When in doubt between vector_store and hybrid, choose vector_store (content search is more common)
     
-    pure_greetings = ["hello", "hi", "hey", "thanks", "thank you", "bye", "good morning", "good evening"]
-    is_pure_greeting = query.strip() in pure_greetings
-    
-    meta_questions = ["how do you work", "what can you do", "help me", "how does this work"]
-    is_meta = any(m in query for m in meta_questions)
-    
-    needs_sql = False
-    is_true_clarification = False
-    
-    if is_pure_greeting or is_meta:
-        needs_sql = False
-        print("🎯 GREETING/META: No SQL execution")
-    else:
-        needs_sql = True
-        is_true_clarification = False
-        print(f"🎯 FORCING SQL EXECUTION: query='{query[:50]}'")
-    
-    tables = ["list_versions", "target_list_entries", "version", "entry", "hcp", "list"]
-    for table in tables:
-        if table in query:
-            if table not in state["session_context"]["mentioned_tables"]:
-                state["session_context"]["mentioned_tables"].append(table)
-            state["session_context"]["current_table"] = table
-    
-    state["needs_sql"] = needs_sql
-    state["is_clarification"] = is_true_clarification
-    
-    print(f"🔀 Router Decision: needs_sql={needs_sql}, is_clarification={is_true_clarification}")
-    return state
-
-
-# ═══════════════════════════════════════════════════════════════
-# CLASSIFY QUERY NODE (Gemini)
-# ═══════════════════════════════════════════════════════════════
-
-def classify_query_node(state: AgentState) -> AgentState:
-    """Classify query type with memory context using Gemini"""
-    
-    if not state.get("needs_sql"):
-        state["query_type"] = "conversation"
-        return state
-    
-    state = initialize_memory(state)
-    
-    query = state.get("user_query", "")
-    session_ctx = state.get("session_context", {})
-    memory = state.get("session_memory", {})
-    
-    recent_context = ""
-    if memory.get("query_history"):
-        recent = memory["query_history"][-3:]
-        recent_context = "Recent queries: " + ", ".join([q["query"][:40] for q in recent])
-    
-    prompt = f"""
-    Classify this query into ONE of:
-    version_comparison, history, attribution, current_state, list_all, ad_hoc_select
-
-    Context table: {session_ctx.get('current_table', 'unknown')}
-    {recent_context}
-    Query: {query}
-    
-    Return only one word category.
+    IMPORTANT:
+    - Return ONLY valid JSON: {{"route": "database_only|vector_store|hybrid", "reasoning": "brief explanation"}}
+    - No markdown, no code fences, no extra text
+    - Be decisive - choose the single best route
     """
-
-    response = model.generate_content(prompt)
-    category = response.text.strip().lower()
-    state["query_type"] = category
-    state["session_context"]["last_query_type"] = category
-    print(f"🧭 Query classified as → {category}")
-    return state
-
-
-# ═══════════════════════════════════════════════════════════════
-# GENERATE SQL NODE (Gemini) WITH MEMORY
-# ═══════════════════════════════════════════════════════════════
-
-def generate_sql_node(state: AgentState) -> AgentState:
-    """Generate SQL with full awareness of conversation history using Gemini"""
-    
-    if not state.get("needs_sql"):
-        state["generated_sql"] = None
-        return state
-    
-    state = initialize_memory(state)
-    
-    user_query = state.get("user_query", "")
-    session_ctx = state.get("session_context", {})
-    memory = state.get("session_memory", {})
-    
-    context_info = f"""
-    Current table/topic: {session_ctx.get('current_table', 'unknown')}
-    Last table queried: {memory.get('last_table', 'unknown')}
-    Previously mentioned tables: {', '.join(session_ctx.get('mentioned_tables', []))}
-    """
-    
-    last_sql = None
-    last_query_text = None
-    last_table = None
-    
-    if memory.get("query_history"):
-        context_info += "\n\nRecent queries in this conversation:\n"
-        for record in memory["query_history"][-5:]:
-            context_info += f"- Turn {record['turn']}: {record['query'][:80]}\n"
-            if record['sql']:
-                context_info += f"  SQL: {record['sql'][:100]}\n"
-                last_sql = record['sql']
-                last_query_text = record['query']
-                if 'FROM' in record['sql'].upper():
-                    table_match = re.search(r'FROM\s+(\w+)', record['sql'], re.IGNORECASE)
-                    if table_match:
-                        last_table = table_match.group(1)
-        
-        if last_sql and last_query_text:
-            context_info += f"""
-    
-    ⚠️ MOST RECENT QUERY (use this as primary context):
-    User asked: "{last_query_text}"
-    SQL executed: {last_sql}
-    Table used: {last_table or 'unknown'}
-    
-    If the current question refers to "them", "those entries", "full entry", "more details",
-    it likely means the results from the above query.
-    """
-    
-    if memory.get("entity_references"):
-        entities = list(memory["entity_references"].keys())[:10]
-        context_info += f"\nMentioned entities: {', '.join(entities)}\n"
-
-    prompt = f"""
-    You are an expert SQL generator for PostgreSQL (Supabase) database.
-
-    Database schema:
-    {SCHEMA_CONTEXT}
-
-    Conversation context:
-    {context_info}
-    
-    Conversation summary:
-    {memory.get('conversation_context', 'First query in session')}
-
-    Current user question: {user_query}
-
-    ⚠️ CRITICAL CONTEXT AWARENESS:
-    The MOST RECENT table queried was: {last_table or memory.get('last_table', 'N/A')}
-    The MOST RECENT SQL executed was: {last_sql or 'N/A'}
-
-    CRITICAL INSTRUCTIONS:
-    1. Generate a **single SELECT SQL query** (no DML/DDL).
-    
-    2. **CONTEXT MATCHING RULES** (HIGHEST PRIORITY):
-       - If user mentions a PERSON NAME (like "Dr. Nikhil Kapoor") that appeared in recent results:
-         → Query the SAME table from the most recent query ({last_table})
-         → Use WHERE clause to filter for that specific person
-       - If user says "give details for X", "show only X", "filter for X":
-         → Query the SAME table from: {last_table}
-         → Add WHERE condition for X
-       - If user asks "give full entry", "show details", "more info":
-         → Query the SAME table: {last_table}
-         → Use SELECT * to show ALL columns
-    
-    3. **TABLE SELECTION**:
-       - If question references "them", "those", "the previous ones": Use {last_table}
-       - If question mentions a specific list type: Use the appropriate table
-       - If uncertain: Default to {last_table}
-    
-    4. **FIELD NAME MATCHING**:
-       - For idn_health_system_entries: contact_name field contains person's name
-       - For target_list_entries: hcp_name field contains person's name
-       - Use ILIKE '%name%' for flexible name matching
-    
-    5. Return valid PostgreSQL SQL only. No explanations, no markdown, no code blocks.
-    """
-
-    response = model.generate_content(prompt)
-    sql_query = response.text.strip()
-    
-    # Clean markdown artifacts from Gemini
-    sql_query = re.sub(r"^```(?:sql)?", "", sql_query, flags=re.IGNORECASE | re.MULTILINE)
-    sql_query = re.sub(r"```$", "", sql_query, flags=re.MULTILINE)
-    sql_query = sql_query.strip()
-
-    state["generated_sql"] = sql_query
-    state["session_context"]["last_sql_query"] = sql_query
-    print("🧩 Generated SQL Query:\n", sql_query)
-    return state
-
-
-# ═══════════════════════════════════════════════════════════════
-# EXECUTE SQL NODE
-# ═══════════════════════════════════════════════════════════════
-
-def execute_sql_node(state: AgentState) -> AgentState:
-    """Execute SQL and store results in memory"""
-    
-    if not state.get("needs_sql") or not state.get("generated_sql"):
-        state["rows"] = []
-        return state
-
-    sql = state.get("generated_sql")
-    conn = None
     
     try:
-        print(f"🔗 Connecting to Supabase...")
-        conn = psycopg2.connect(SUPABASE_DB_URL)
+        response = model.generate_content(routing_prompt)
+        clean_text = response.text.strip()
+        clean_text = clean_text.replace("```json", "").replace("```", "").strip()
         
+        routing_decision = json.loads(clean_text)
+        route = routing_decision.get("route", "database_only")
+        reasoning = routing_decision.get("reasoning", "No reasoning provided")
+        
+        # Validate route
+        if route not in ["database_only", "vector_store", "hybrid"]:
+            print(f"⚠ Invalid route '{route}', defaulting to database_only")
+            route = "database_only"
+        
+        # Check Pinecone availability for routes that need it
+        if route in ["vector_store", "hybrid"] and not PINECONE_AVAILABLE:
+            print(f"⚠ {route} requested but Pinecone not available, falling back to database_only")
+            route = "database_only"
+        
+        state_copy["route"] = route
+        state_copy["routing_reasoning"] = reasoning
+        
+        print(f"\n{'='*60}")
+        print(f"🎯 INTELLIGENT ROUTING DECISION")
+        print(f"{'='*60}")
+        print(f"Query: {query[:80]}...")
+        print(f"Route: {route.upper()}")
+        print(f"Reasoning: {reasoning}")
+        print(f"{'='*60}\n")
+        
+    except Exception as e:
+        print(f"❌ Routing error: {e}, defaulting to database_only")
+        state_copy["route"] = "database_only"
+        state_copy["routing_reasoning"] = f"Error in routing: {str(e)}"
+    
+    return state_copy
+
+
+# =============================================================================
+# CLASSIFIER NODE
+# =============================================================================
+
+def classify_query_node(state: AgentState) -> AgentState:
+    """Classify query type for better response formatting"""
+    state_copy = dict(state)
+    route = state_copy.get("route", "database_only")
+    query = state_copy.get("user_query", "").lower()
+
+    if route == "database_only":
+        if "count" in query or "how many" in query:
+            state_copy["query_type"] = "aggregate"
+        elif "list" in query or "all" in query or "show" in query:
+            state_copy["query_type"] = "listing"
+        else:
+            state_copy["query_type"] = "detail"
+    elif route == "vector_store":
+        state_copy["query_type"] = "semantic_search"
+    elif route == "hybrid":
+        state_copy["query_type"] = "hybrid_search"
+
+    return state_copy
+
+
+# =============================================================================
+# DATABASE QUERY PATH
+# =============================================================================
+
+def generate_and_execute_sql(state: AgentState) -> AgentState:
+    """Generate SQL using LLM with schema context"""
+    state_copy = dict(state)
+    query = state_copy.get("user_query", "")
+    context_str = get_conversation_context(state_copy)
+
+    sql_prompt = f"""
+    You are a PostgreSQL expert. Generate a valid SQL query based on the schema and user request.
+    
+    DATABASE SCHEMA:
+    {SCHEMA_CONTEXT}
+    
+    CONVERSATION CONTEXT:
+    {context_str}
+    
+    USER REQUEST:
+    {query}
+    
+    REQUIREMENTS:
+    - Generate ONLY a valid PostgreSQL SELECT query
+    - Use table/column names EXACTLY as shown in schema
+    - Always add LIMIT 500 to prevent huge result sets
+    - Use proper JOINs if multiple tables are needed
+    - Handle NULL values appropriately
+    - Return ONLY the SQL query, no markdown, no explanations
+    
+    SQL QUERY:
+    """
+
+    try:
+        response = model.generate_content(sql_prompt)
+        sql = clean_sql(response.text)
+        
+        state_copy["sql"] = sql
+        print(f"📝 Generated SQL:\n{sql}\n")
+    except Exception as e:
+        print(f"❌ SQL generation error: {e}")
+        state_copy["sql"] = None
+        state_copy["error"] = f"SQL generation failed: {str(e)}"
+        return state_copy
+
+    # Execute SQL
+    if not SUPABASE_DB_URL or not sql:
+        state_copy["results"] = []
+        state_copy["response"] = "Database not configured or SQL generation failed."
+        state_copy["results_count"] = 0
+        return state_copy
+
+    conn = None
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URL)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql)
             rows = cur.fetchall()
-            state["rows"] = [dict(r) for r in rows]
-            print(f"📊 Retrieved {len(rows)} rows")
-            
-            state["session_context"]["last_results_summary"] = f"Retrieved {len(rows)} rows"
-            state["session_context"]["last_result_count"] = len(rows)
-            
+            state_copy["results"] = [dict(r) for r in rows]
+            state_copy["results_count"] = len(rows)
+            print(f"✅ Retrieved {len(rows)} rows from database")
     except Exception as e:
-        state["rows"] = []
-        print("❌ SQL Execution Error:", str(e))
-        state["session_context"]["last_results_summary"] = f"Error: {str(e)}"
-        
-    finally:
-        if conn is not None:
-            conn.close()
-
-    return state
-
-
-# ═══════════════════════════════════════════════════════════════
-# FETCH VERSIONS NODE
-# ═══════════════════════════════════════════════════════════════
-
-def fetch_versions_node(state: AgentState) -> AgentState:
-    """Fetch version history for analysis"""
-    rid = state.get("request_id")
-    if rid is None:
-        print("⚠️ No request_id provided — skipping version fetch.")
-        state["versions"] = []
-        return state
-
-    sql = """
-    SELECT id AS version_id, version_number, created_at
-    FROM list_versions
-    WHERE request_id = %s
-    ORDER BY version_number ASC;
-    """
-
-    conn = None
-    try:
-        conn = psycopg2.connect(SUPABASE_DB_URL)
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, (rid,))
-            rows = cur.fetchall()
-            state["versions"] = [dict(r) for r in rows]
-            print(f"📄 Found {len(rows)} versions for request_id={rid}")
-    except Exception as e:
-        print("❌ Error fetching versions:", e)
-        state["versions"] = []
+        print(f"❌ SQL execution error: {e}")
+        state_copy["results"] = []
+        state_copy["error"] = f"Database query failed: {str(e)}"
+        state_copy["results_count"] = 0
     finally:
         if conn:
             conn.close()
 
-    return state
+    return state_copy
 
 
-# ═══════════════════════════════════════════════════════════════
-# ANALYZE CHANGES NODE
-# ═══════════════════════════════════════════════════════════════
+# =============================================================================
+# VECTOR STORE QUERY PATH - PINECONE SEMANTIC SEARCH
+# =============================================================================
 
-def analyze_changes_node(state: AgentState) -> AgentState:
-    """Analyze version changes"""
-    versions = state.get("versions", [])
-    if not versions:
-        print("⚠️ No versions found — skipping analysis.")
-        state["most_dynamic"] = {"version_number": None, "total": 0}
-        return state
+def query_vector_store(state: AgentState) -> AgentState:
+    """
+    Semantic search using Pinecone embeddings.
+    Uses vector similarity to find relevant documents.
+    """
+    state_copy = dict(state)
+    query = state_copy.get("user_query", "")
+    
+    print(f"\n{'='*60}")
+    print(f"🔍 SEMANTIC SEARCH IN PINECONE")
+    print(f"{'='*60}")
+    print(f"Query: {query}")
+    
+    if not PINECONE_AVAILABLE or not embedding_model or not pinecone_index:
+        print("❌ Pinecone not available")
+        state_copy["results"] = []
+        state_copy["response"] = "Vector search is not available."
+        state_copy["results_count"] = 0
+        return state_copy
+    
+    try:
+        # Step 1: Generate query embedding
+        print("📊 Generating query embedding...")
+        query_embedding = embedding_model.encode([query]).tolist()[0]
+        
+        # Step 2: Perform semantic search in Pinecone
+        print("🔎 Performing semantic similarity search in Pinecone...")
+        search_results = pinecone_index.query(
+            vector=query_embedding,
+            top_k=20,
+            include_metadata=True
+        )
+        
+        if not search_results or not search_results.get('matches'):
+            print("📭 No results found")
+            state_copy["results"] = []
+            state_copy["response"] = "No relevant documents found."
+            state_copy["results_count"] = 0
+            return state_copy
+        
+        # Step 3: Process results and group by document
+        print(f"✅ Found {len(search_results['matches'])} relevant chunks")
+        
+        doc_chunks_map = {}
+        for match in search_results['matches']:
+            metadata = match.get('metadata', {})
+            similarity = match.get('score', 0)
+            chunk_text = match.get('values', {}).get('text', '')
+            
+            doc_id = metadata.get('doc_id')
+            if not doc_id:
+                continue
+            
+            if doc_id not in doc_chunks_map:
+                doc_chunks_map[doc_id] = {
+                    "doc_id": doc_id,
+                    "filename": metadata.get('filename', 'Unknown'),
+                    "uploader": metadata.get('uploader_name', 'Unknown'),
+                    "table_name": metadata.get('table_name'),
+                    "timestamp": metadata.get('timestamp'),
+                    "chunks": [],
+                    "max_similarity": similarity
+                }
+            
+            doc_chunks_map[doc_id]["chunks"].append({
+                "text": chunk_text or metadata.get('chunk_text', ''),
+                "similarity": similarity,
+                "metadata": metadata
+            })
+            
+            if similarity > doc_chunks_map[doc_id]["max_similarity"]:
+                doc_chunks_map[doc_id]["max_similarity"] = similarity
+        
+        # Step 4: Sort documents by relevance and extract changes
+        print("📊 Extracting structured information from top documents...")
+        sorted_docs = sorted(
+            doc_chunks_map.values(),
+            key=lambda x: x["max_similarity"],
+            reverse=True
+        )
+        
+        results = []
+        for doc_data in sorted_docs[:5]:
+            combined_text = "\n\n".join([c["text"] for c in doc_data["chunks"][:5]])
+            changes = extract_changes_from_text(combined_text)
+            
+            result = {
+                "doc_id": doc_data["doc_id"],
+                "filename": doc_data["filename"],
+                "uploader": doc_data["uploader"],
+                "table_name": doc_data.get("table_name", ""),
+                "timestamp": doc_data.get("timestamp", ""),
+                "relevance_score": doc_data["max_similarity"],
+                "action": changes.get("action"),
+                "items_count": changes.get("count", 0),
+                "items": changes.get("items", []),
+                "list_name": changes.get("list_name"),
+                "reason": changes.get("reason"),
+                "top_chunks": doc_data["chunks"][:3]
+            }
+            results.append(result)
+        
+        state_copy["results"] = results
+        state_copy["results_count"] = len(results)
+        
+        print(f"✅ Processed {len(results)} documents with semantic search")
+        print(f"{'='*60}\n")
+        
+    except Exception as e:
+        print(f"❌ Vector search error: {e}")
+        import traceback
+        traceback.print_exc()
+        state_copy["results"] = []
+        state_copy["response"] = "An error occurred during semantic search. Please try again."
+        state_copy["results_count"] = 0
+    
+    return state_copy
 
-    comparisons = []
-    most_dynamic = {"version_number": None, "total": -1}
 
-    conn = None
+# =============================================================================
+# HYBRID QUERY PATH - PINECONE + METADATA
+# =============================================================================
+
+def hybrid_query(state: AgentState) -> AgentState:
+    """
+    Hybrid search using Pinecone semantic search + metadata filtering.
+    LLM extracts filters → Database filters → Semantic similarity search
+    """
+    state_copy = dict(state)
+    query = state_copy.get("user_query", "")
+    
+    print(f"\n{'='*60}")
+    print(f"🔀 HYBRID SEARCH: Metadata + Semantic Content (Pinecone)")
+    print(f"{'='*60}")
+    print(f"Query: {query}")
+    
+    if not SUPABASE_DB_URL or not PINECONE_AVAILABLE or not embedding_model:
+        print("❌ Hybrid search requirements not met")
+        state_copy["results"] = []
+        state_copy["response"] = "Hybrid search is not available."
+        state_copy["results_count"] = 0
+        return state_copy
+
+    # Step 1: LLM extracts metadata filters
+    filter_prompt = f"""
+    Extract metadata filters from this user query for document search:
+    
+    QUERY: "{query}"
+    
+    Extract and return JSON:
+    {{
+        "uploader": "name of uploader/user if mentioned, else null",
+        "table_name": "table/list name if mentioned, else null",
+        "days_ago": "number of days if time period mentioned (0=today, 1=yesterday, 7=last week), else null",
+        "search_term": "the main topic/content to search for (this will be used for semantic search)"
+    }}
+    
+    Return ONLY valid JSON, no markdown, no explanations.
+    """
+
+    try:
+        filter_response = model.generate_content(filter_prompt)
+        filter_text = filter_response.text.strip()
+        filter_text = filter_text.replace("```json", "").replace("```", "").strip()
+        params = json.loads(filter_text)
+        print(f"📋 Extracted filters: {json.dumps(params, indent=2)}")
+    except Exception as e:
+        print(f"⚠ Filter extraction failed: {e}, using query as search term")
+        params = {"search_term": query}
+
+    # Step 2: Query metadata table with filters
+    sql = "SELECT doc_id, filename, uploader_name, table_name, timestamp FROM history_table WHERE operation_type = 'INSERT'"
+    sql_params = []
+
+    if params.get("uploader"):
+        uploader = params["uploader"].strip().lower()
+        sql += " AND LOWER(triggered_by) LIKE LOWER(%s)"
+        sql_params.append(f"%{uploader}%")
+        print(f"🔍 Filter: uploader contains '{uploader}'")
+
+    if params.get("table_name"):
+        table = params["table_name"].strip().lower()
+        sql += " AND LOWER(table_name) LIKE LOWER(%s)"
+        sql_params.append(f"%{table}%")
+        print(f"🔍 Filter: table_name contains '{table}'")
+
+    if params.get("days_ago") is not None:
+        days = params["days_ago"]
+        if days == 0:
+            sql += " AND timestamp >= CURRENT_DATE"
+            print(f"🔍 Filter: documents from today")
+        else:
+            sql += " AND timestamp >= NOW() - INTERVAL '%s days'"
+            sql_params.append(days)
+            print(f"🔍 Filter: documents from last {days} days")
+
+    sql += " ORDER BY timestamp DESC LIMIT 100;"
+
     try:
         conn = psycopg2.connect(SUPABASE_DB_URL)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            for i in range(1, len(versions)):
-                prev_id = versions[i - 1]["version_id"]
-                curr_id = versions[i]["version_id"]
+            cur.execute(sql, sql_params)
+            metadata_rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
 
-                cur.execute("SELECT hcp_id FROM target_list_entries WHERE version_id = %s", (prev_id,))
-                prev_hcps = {r["hcp_id"] for r in cur.fetchall()}
+        print(f"📚 Metadata filter returned {len(metadata_rows)} documents")
 
-                cur.execute("SELECT hcp_id FROM target_list_entries WHERE version_id = %s", (curr_id,))
-                curr_hcps = {r["hcp_id"] for r in cur.fetchall()}
+        if not metadata_rows:
+            state_copy["results"] = []
+            state_copy["response"] = "No documents match the metadata filters."
+            state_copy["results_count"] = 0
+            return state_copy
 
-                added = curr_hcps - prev_hcps
-                removed = prev_hcps - curr_hcps
-                total = len(added) + len(removed)
+        # Step 3: Use Pinecone semantic search with filters
+        doc_ids = [row['doc_id'] for row in metadata_rows]
+        search_term = params.get("search_term", query)
+        
+        print(f"🔎 Performing SEMANTIC search for: '{search_term}'")
+        print(f"   Searching within {len(doc_ids)} filtered documents")
+        
+        # Generate embedding for search term
+        query_embedding = embedding_model.encode([search_term]).tolist()[0]
 
-                comparisons.append({
-                    "from_version": versions[i - 1]["version_number"],
-                    "to_version": versions[i]["version_number"],
-                    "added": len(added),
-                    "removed": len(removed),
-                    "total": total
+        # Perform semantic similarity search with doc_id filter
+        search_results = pinecone_index.query(
+            vector=query_embedding,
+            top_k=min(50, len(doc_ids) * 3),
+            filter={"doc_id": {"$in": doc_ids}},
+            include_metadata=True
+        )
+
+        # Step 4: Combine and format results
+        combined_results = []
+        if search_results and search_results.get('matches'):
+            for match in search_results['matches']:
+                metadata = match.get('metadata', {})
+                similarity = match.get('score', 0)
+                chunk_text = match.get('values', {}).get('text', '')
+                
+                doc_id = metadata.get('doc_id')
+                db_metadata = next((m for m in metadata_rows if m['doc_id'] == doc_id), {})
+
+                combined_results.append({
+                    "chunk_text": chunk_text or metadata.get('chunk_text', ''),
+                    "metadata": metadata,
+                    "filename": db_metadata.get('filename', 'Unknown'),
+                    "uploader": db_metadata.get('uploader_name', 'Unknown'),
+                    "table_name": db_metadata.get('table_name', ''),
+                    "timestamp": db_metadata.get('timestamp', ''),
+                    "relevance_score": similarity
                 })
+        
+        # Sort by relevance
+        combined_results.sort(key=lambda x: x['relevance_score'], reverse=True)
 
-                if total > most_dynamic["total"]:
-                    most_dynamic = {
-                        "version_number": versions[i]["version_number"],
-                        "total": total
-                    }
+        state_copy["results"] = combined_results
+        state_copy["results_count"] = len(combined_results)
+        
+        print(f"✅ Hybrid search complete: {len(combined_results)} relevant chunks")
+        print(f"{'='*60}\n")
+
     except Exception as e:
-        print("❌ Error analyzing changes:", e)
-    finally:
-        if conn:
-            conn.close()
+        print(f"❌ Hybrid query error: {e}")
+        import traceback
+        traceback.print_exc()
+        state_copy["results"] = []
+        state_copy["response"] = "An error occurred during hybrid search. Please try again."
+        state_copy["results_count"] = 0
 
-    state["comparisons"] = comparisons
-    state["most_dynamic"] = most_dynamic
-    print("🔍 Most dynamic version:", most_dynamic)
-    return state
+    return state_copy
 
 
-# ═══════════════════════════════════════════════════════════════
-# SMART SUMMARIZER WITH MEMORY (Gemini)
-# ═══════════════════════════════════════════════════════════════
+# =============================================================================
+# RESPONSE FORMATTER
+# =============================================================================
 
-def summarizer_node(state: AgentState) -> AgentState:
-    """
-    Generate intelligent responses using full conversation memory with Gemini.
-    Shows all results when appropriate, provides context-aware summaries.
-    """
+def format_response(state: AgentState) -> AgentState:
+    """Format results into natural conversation response"""
+    state_copy = dict(state)
+    route = state_copy.get("route", "database_only")
+    query_type = state_copy.get("query_type", "detail")
+    results = state_copy.get("results", [])
     
-    state = initialize_memory(state)
-    
-    query = state.get("user_query", "")
-    query_type = state.get("query_type", "conversation")
-    rows = state.get("rows", [])
-    is_clarification = state.get("is_clarification", False)
-    memory = state.get("session_memory", {})
-    session_ctx = state.get("session_context", {})
+    if state_copy.get("response"):
+        return state_copy
 
-    conversation_history = state.get("conversation_history", [])
-    
-    history_text = memory.get("conversation_context", "")
-    if not history_text and conversation_history:
-        history_text = "Recent conversation:\n"
-        for msg in conversation_history[-4:]:
-            role = "User" if msg["role"] == "user" else "Assistant"
-            history_text += f"{role}: {msg['content'][:100]}...\n"
-
-    # STRATEGY 1: Direct display for list queries
-    if query_type in ["list_all", "ad_hoc_select"] and rows:
-        row_count = len(rows)
-        
-        if row_count <= 100:
-            if rows and isinstance(rows[0], dict):
-                keys = list(rows[0].keys())
+    # =========== DATABASE ONLY RESPONSES ===========
+    if route == "database_only":
+        if not results:
+            response = "📭 No results found in database."
+        else:
+            row_count = len(results)
+            
+            if query_type == "aggregate":
+                if row_count == 1 and len(results[0]) == 1:
+                    value = list(results[0].values())[0]
+                    response = f"Result: {value}"
+                else:
+                    response = f"Found {row_count} records"
+            else:
+                response = f"📊 Database Results: {row_count} records\n\n"
                 
-                display_fields = []
-                priority_fields = ['hcp_name', 'name', 'system_name', 'title', 'specialty', 
-                                 'contact_name', 'system_id', 'hcp_id', 'tier', 'importance']
-                
-                for field in priority_fields:
-                    if field in keys:
-                        display_fields.append(field)
-                
-                if not display_fields:
-                    display_fields = [k for k in keys if k not in ['id', 'created_at', 'updated_at', 'version_id']][:5]
-                
-                field_labels = {
-                    'hcp_name': 'Name', 'name': 'Name', 'system_name': 'System',
-                    'title': 'Title', 'specialty': 'Specialty', 'contact_name': 'Contact',
-                    'system_id': 'ID', 'hcp_id': 'HCP ID', 'tier': 'Tier',
-                    'importance': 'Importance', 'contact_email': 'Email',
-                    'phone': 'Phone', 'address': 'Address', 'city': 'City',
-                    'state': 'State', 'npi': 'NPI', 'revenue': 'Revenue',
-                    'prescriber_type': 'Type'
-                }
-                
-                results_list = []
-                for i, row in enumerate(rows):
-                    row_parts = []
-                    for field in display_fields:
-                        value = row.get(field)
-                        if value:
-                            label = field_labels.get(field, field.replace('_', ' ').title())
-                            row_parts.append(f"{label}: {value}")
+                if row_count <= 10 and results:
+                    headers = list(results[0].keys())[:5]
+                    response += "| " + " | ".join(headers) + " |\n"
+                    response += "|" + "|".join(["---"] * len(headers)) + "|\n"
                     
-                    if row_parts:
-                        results_list.append(f"{i+1}. {' | '.join(row_parts)}")
-                
-                results_text = "\n".join(results_list)
-                response = f"Here are all {row_count} entries:\n\n{results_text}"
-                state["response"] = response
-                print(f"\n🗣️ Displaying all {row_count} results with details.\n")
-                
-                state = update_memory(state)
-                return state
-        
+                    for row in results:
+                        values = [str(row.get(h, ""))[:40] for h in headers]
+                        response += "| " + " | ".join(values) + " |\n"
+                else:
+                    for i, row in enumerate(results[:20], 1):
+                        response += f"{i}. {str(row)[:150]}...\n"
+                    if row_count > 20:
+                        response += f"\n... and {row_count - 20} more records"
+
+    # =========== VECTOR STORE RESPONSES (Semantic Search) ===========
+    elif route == "vector_store":
+        if not results:
+            response = "📭 No relevant documents found."
         else:
-            sample_size = 20
-            if rows and isinstance(rows[0], dict):
-                keys = list(rows[0].keys())
+            response = f"📝 Semantic Search Results: {len(results)} documents\n\n"
+            
+            for i, doc in enumerate(results, 1):
+                filename = doc.get("filename", "Unknown")
+                uploader = doc.get("uploader", "Unknown")
+                relevance = int(doc.get("relevance_score", 0) * 100)
+                action = doc.get("action")
+                items_count = doc.get("items_count", 0)
+                list_name = doc.get("list_name")
+                reason = doc.get("reason")
                 
-                display_fields = []
-                priority_fields = ['hcp_name', 'name', 'system_name', 'title', 'specialty', 
-                                 'contact_name', 'system_id', 'tier']
-                for field in priority_fields:
-                    if field in keys:
-                        display_fields.append(field)
+                response += f"{i}. {filename} ({relevance}% relevant)\n"
+                response += f"   👤 Uploaded by: {uploader}\n"
                 
-                if not display_fields:
-                    display_fields = [k for k in keys if k not in ['id', 'created_at', 'updated_at']][:4]
+                if action:
+                    response += f"   ✏ Action: {action.upper()} {items_count} items"
+                    if list_name:
+                        response += f" to {list_name}"
+                    response += "\n"
                 
-                field_labels = {
-                    'hcp_name': 'Name', 'name': 'Name', 'system_name': 'System',
-                    'title': 'Title', 'specialty': 'Specialty', 'contact_name': 'Contact',
-                    'system_id': 'ID', 'tier': 'Tier', 'importance': 'Importance',
-                    'contact_email': 'Email', 'revenue': 'Revenue'
-                }
+                if reason and reason != "No reason provided":
+                    response += f"   💬 Reason: {reason}\n"
                 
-                sample_list = []
-                for i, row in enumerate(rows[:sample_size]):
-                    row_parts = []
-                    for field in display_fields:
-                        value = row.get(field)
-                        if value:
-                            label = field_labels.get(field, field.replace('_', ' ').title())
-                            row_parts.append(f"{label}: {value}")
-                    if row_parts:
-                        sample_list.append(f"{i+1}. {' | '.join(row_parts)}")
+                chunks = doc.get("top_chunks", [])
+                if chunks:
+                    response += f"   📄 Relevant content:\n"
+                    for chunk in chunks[:2]:
+                        text = chunk.get("text", "")[:200]
+                        chunk_sim = int(chunk.get("similarity", 0) * 100)
+                        response += f"      - [{chunk_sim}%] {text}...\n"
                 
-                sample_text = "\n".join(sample_list)
-                
-                response = f"""Found {row_count} entries in total.
+                response += "\n"
 
-Here are the first {sample_size}:
-
-{sample_text}
-
-... and {row_count - sample_size} more entries.
-
-Would you like me to show a specific range or filter these results?"""
-                
-                state["response"] = response
-                print(f"\n🗣️ Large dataset: showing {sample_size}/{row_count} results.\n")
-                
-                state = update_memory(state)
-                return state
-
-    # STRATEGY 2: Use Gemini for summarization
-    else:
-        if rows:
-            data_summary = json.dumps(rows[:5], indent=2, default=str)
+    # =========== HYBRID RESPONSES ===========
+    elif route == "hybrid":
+        if not results:
+            response = "📭 No documents match your search criteria."
         else:
-            data_summary = "No data."
+            response = f"🔍 Hybrid Search: {len(results)} matches\n"
+            response += "Filtered by metadata + semantic content search\n\n"
+            
+            docs_map = {}
+            for result in results:
+                filename = result.get('filename', 'Unknown')
+                if filename not in docs_map:
+                    docs_map[filename] = {
+                        'uploader': result.get('uploader', 'Unknown'),
+                        'chunks': [],
+                        'max_relevance': result.get('relevance_score', 0)
+                    }
+                docs_map[filename]['chunks'].append({
+                    'text': result.get('chunk_text', ''),
+                    'relevance': result.get('relevance_score', 0)
+                })
+                docs_map[filename]['max_relevance'] = max(
+                    docs_map[filename]['max_relevance'],
+                    result.get('relevance_score', 0)
+                )
+            
+            sorted_docs = sorted(
+                docs_map.items(),
+                key=lambda x: x[1]['max_relevance'],
+                reverse=True
+            )
+            
+            for i, (filename, data) in enumerate(sorted_docs[:10], 1):
+                uploader = data['uploader']
+                relevance = int(data['max_relevance'] * 100)
+                
+                response += f"{i}. {filename} (by {uploader}, {relevance}% relevant)\n"
+                
+                top_chunks = sorted(data['chunks'], key=lambda x: x['relevance'], reverse=True)[:2]
+                for chunk in top_chunks:
+                    text = chunk['text'][:250]
+                    chunk_rel = int(chunk['relevance'] * 100)
+                    response += f"   [{chunk_rel}%] {text}...\n"
+                response += "\n"
 
-        prompt = f"""
-        You are a helpful assistant summarizing database query results.
+    state_copy["response"] = response
+    return state_copy
 
-        Query: {query}
-        Query type: {query_type}
-        Data retrieved: {data_summary}
-        
-        Conversation context:
-        {history_text}
 
-        Provide a clear and natural response to the user's query based on the data.
-        """
-
-        response = model.generate_content(prompt)
-        summary = response.text.strip()
-        state["response"] = summary
-        print("\n🗣️ Response generated with Gemini & memory context.\n")
-
-        state = update_memory(state)
-        return state
+if __name__ == "__main__":
+    print("✅ Advanced LLM-based agent nodes with Pinecone loaded successfully")
