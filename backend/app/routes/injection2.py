@@ -1,6 +1,6 @@
 """
-Smart Document Injection: Upload → Extract → Generate SQL → Execute → Store with Audit Trail
-Processes documents to automatically update target_list with full history tracking in Supabase and Pinecone
+Smart Document Injection: Upload → Extract Metadata → Extract Text → Generate SQL → Execute → Store
+Auto-extracts uploader info from document, no form fields needed
 """
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
@@ -90,6 +90,26 @@ def extract_text_from_file(file_path: str, filename: str) -> str:
         )
     
     return text.strip()
+
+
+def extract_table_name_from_document(document_text: str) -> str:
+    """
+    Extract table name from the beginning of document
+    Looks for "table:" or "Table:" on the first few lines
+    """
+    lines = document_text.split('\n')[:10]  # Check first 10 lines
+    
+    for line in lines:
+        # Look for "table:" or "Table:" pattern
+        match = re.search(r'table\s*:\s*(\w+)', line, re.IGNORECASE)
+        if match:
+            table_name = match.group(1).strip()
+            print(f"   📍 Found table name in document: {table_name}")
+            return table_name
+    
+    # Default to target_list if not found
+    print(f"   📍 Table name not found in document, using default: target_list")
+    return "target_list"
 
 
 def generate_document_id(uploader_name: str, filename: str, timestamp: str) -> str:
@@ -235,6 +255,7 @@ def execute_sql_and_get_changes(sql: str, extracted_data: dict) -> tuple:
     """
     Execute SQL query and return (success, changed_rows, change_description)
     Triggers will automatically log to history_table
+    ⚠️ DO NOT manually insert history records here - triggers handle it!
     """
     if not SUPABASE_DB_URL:
         raise HTTPException(status_code=500, detail="Database not configured")
@@ -251,21 +272,16 @@ def execute_sql_and_get_changes(sql: str, extracted_data: dict) -> tuple:
             params = []
             
             if action == 'INSERT':
-                # Extract field names from the SQL INSERT statement
-                # Parse: INSERT INTO target_list (field1, field2, ...) VALUES
-                import re
                 match = re.search(r'\((.*?)\)\s+VALUES', sql, re.IGNORECASE)
                 if match:
                     fields_str = match.group(1)
                     fields = [f.strip() for f in fields_str.split(',')]
                     
-                    # Build params in the same order as SQL fields
                     for field in fields:
                         params.append(hcp_data.get(field))
                     
                     print(f"   📍 Parsed {len(fields)} fields from SQL: {fields}")
                 else:
-                    # Fallback: use all fields (old behavior)
                     for key in ['hcp_code', 'full_name', 'gender', 'qualification', 'specialty', 
                                'designation', 'email', 'phone', 'hospital_name', 'hospital_address',
                                'city', 'state', 'pincode', 'experience_years', 'influence_score',
@@ -274,30 +290,23 @@ def execute_sql_and_get_changes(sql: str, extracted_data: dict) -> tuple:
                         params.append(hcp_data.get(key))
             
             elif action == 'UPDATE':
-                # Extract SET fields and WHERE field from SQL
-                import re
                 set_match = re.search(r'SET\s+(.*?)\s+WHERE', sql, re.IGNORECASE)
                 if set_match:
                     set_clause = set_match.group(1)
-                    # Extract field names (field=%s, field=%s, ...)
                     set_fields = [f.split('=')[0].strip() for f in set_clause.split(',')]
                     
-                    # Build params for SET clause
                     for field in set_fields:
                         params.append(hcp_data.get(field))
                     
-                    # Add identifier for WHERE clause
                     params.append(identifier)
                     print(f"   📍 Parsed {len(set_fields)} update fields: {set_fields}")
                 else:
-                    # Fallback
                     for key, value in hcp_data.items():
                         if value is not None:
                             params.append(value)
                     params.append(identifier)
             
             elif action == 'DELETE':
-                # Only identifier for WHERE
                 params = [identifier]
             
             # Count placeholders in SQL
@@ -307,13 +316,12 @@ def execute_sql_and_get_changes(sql: str, extracted_data: dict) -> tuple:
             
             if placeholder_count != len(params):
                 print(f"   ⚠️  Parameter count mismatch! Adjusting...")
-                # Trim or pad params to match
                 if len(params) > placeholder_count:
                     params = params[:placeholder_count]
                 elif len(params) < placeholder_count:
                     params.extend([None] * (placeholder_count - len(params)))
             
-            # Execute query
+            # Execute query - trigger will handle history_table insert
             cur.execute(sql, params)
             affected_rows = cur.rowcount
             
@@ -346,27 +354,17 @@ async def inject_data(
     file: UploadFile = File(...)
 ):
     """
-    Smart Document Upload: Extract → Generate SQL → Execute → Store
+    Smart Document Upload: Extract Table Name → Extract Text → Generate SQL → Execute → Store
     
-    Process Flow:
-    1. Extract text from document (PDF/DOCX/TXT)
-    2. Use LLM to identify action (INSERT/UPDATE/DELETE) and extract HCP data
-    3. Generate SQL query based on target_list schema
-    4. Execute SQL on target_list (triggers auto-update history_table)
-    5. Store document chunks in Pinecone with doc_id
-    6. Link doc_id in history_table for full traceability
-    
-    Args:
-        uploader_name: Name of person uploading
-        file: Document file (PDF, DOCX, or TXT)
-    
-    Returns:
-        Success message with doc_id, action taken, and changes made
+    IMPORTANT: 
+    - uploader_name provided as form field
+    - table_name extracted from document (look for "Table: table_name" on first line)
+    - All HCP data extracted from document body
+    - Defaults to "target_list" if no table name found
     """
     
     supabase = get_supabase_client()
     timestamp = datetime.utcnow().isoformat()
-    table_name = "target_list"
     
     # Save uploaded file temporarily
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
@@ -388,23 +386,38 @@ async def inject_data(
         
         print(f"   ✅ Extracted {len(extracted_text)} characters")
         
-        # Step 2: Use LLM to extract structured data
-        print(f"2️⃣  Analyzing document with AI...")
+        # Step 2: Extract table name from document
+        print(f"2️⃣  Extracting table name from document...")
+        table_name = extract_table_name_from_document(extracted_text)
+        
+        # Step 3: Use LLM to extract HCP structured data
+        print(f"3️⃣  Analyzing document for HCP data...")
         extracted_data = extract_entities_with_llm(extracted_text)
         print(f"   Action: {extracted_data['action']}")
         print(f"   Subject: {extracted_data['hcp_data'].get('full_name', 'Unknown')}")
         
-        # Step 3: Generate SQL query
-        print(f"3️⃣  Generating SQL query...")
+        # Step 4: Generate SQL query
+        print(f"4️⃣  Generating SQL query...")
         sql = generate_sql_from_document(extracted_data)
         
-        # Step 4: Execute SQL on target_list
-        print(f"4️⃣  Executing query on target_list...")
+        # Step 5: Execute SQL on target_list
+        # ⚠️ Trigger will automatically insert into history_table
+        print(f"5️⃣  Executing query on target_list...")
         success, affected_rows, change_desc = execute_sql_and_get_changes(sql, extracted_data)
         print(f"   ✅ {change_desc}")
         
-        # Step 5: Generate doc_id and prepare for storage
-        print(f"5️⃣  Preparing document for storage...")
+        # Get the version_number that was auto-created by trigger
+        print(f"6️⃣  Fetching auto-created history entry...")
+        version_resp = supabase.table("history_table").select("version_number") \
+            .eq("table_name", table_name) \
+            .order("version_number", desc=True) \
+            .limit(1) \
+            .execute()
+        
+        version_number = version_resp.data[0]["version_number"] if version_resp.data else 1
+        
+        # Step 6: Generate doc_id
+        print(f"7️⃣  Preparing document for storage...")
         doc_id = generate_document_id(uploader_name, file.filename, timestamp)
         
         # Split text into chunks
@@ -413,74 +426,49 @@ async def inject_data(
         # Generate embeddings for semantic search
         chunk_embeddings = embedding_model.encode(text_chunks).tolist()
         
-        # Step 6: Store in Pinecone with metadata
-        print(f"6️⃣  Storing in Pinecone...")
+        # Step 7: Store in Pinecone with metadata
+        print(f"8️⃣  Storing in Pinecone...")
         vectors_to_upsert = []
         
         for i, (chunk, embedding) in enumerate(zip(text_chunks, chunk_embeddings)):
             chunk_id = f"{doc_id}_chunk_{i}"
             
-            metadata = {
+            metadata_vector = {
                 "doc_id": doc_id,
+                "version_number": str(version_number),
                 "uploader_name": uploader_name,
                 "table_name": table_name,
                 "action": extracted_data['action'],
                 "hcp_name": extracted_data['hcp_data'].get('full_name', ''),
-                "hcp_email": extracted_data['hcp_data'].get('email', ''),
                 "filename": file.filename,
                 "file_type": os.path.splitext(file.filename)[1],
                 "timestamp": timestamp,
                 "chunk_index": str(i),
                 "total_chunks": str(len(text_chunks)),
                 "chunk_size": str(len(chunk)),
-                "chunk_text": chunk[:500],  # First 500 chars for preview
+                "chunk_text": chunk[:500],
                 "change_description": change_desc
             }
             
-            vectors_to_upsert.append((chunk_id, embedding, metadata))
+            vectors_to_upsert.append((chunk_id, embedding, metadata_vector))
         
         # Upload to Pinecone
         index.upsert(vectors=vectors_to_upsert)
         print(f"   ✅ Stored {len(vectors_to_upsert)} chunks in Pinecone")
         
-        # Step 7: Update history_table with doc_id
-        print(f"7️⃣  Logging to history_table...")
+        # Step 8: Update the AUTO-CREATED history entry with doc_id
+        print(f"9️⃣  Linking doc_id to history entry...")
         
-        # Get latest version number
-        version_resp = supabase.table("history_table").select("version_number") \
-            .eq("table_name", table_name) \
-            .order("version_number", desc=True) \
-            .limit(1) \
-            .execute()
-        
-        last_version = version_resp.data[0]["version_number"] if version_resp.data else 0
-        new_version = last_version + 1
-        
-        # Map action to operation_type
-        operation_type_map = {
-            'INSERT': 'INSERT',
-            'UPDATE': 'UPDATE',
-            'DELETE': 'DELETE',
-            'REMOVE': 'DELETE'
-        }
-        
-        history_record = {
-            "version_number": new_version,
-            "operation_type": operation_type_map.get(extracted_data['action'], 'UPDATE'),
-            "table_name": table_name,
-            "total_rows": None,
-            "changed_rows": affected_rows,
-            "reason": extracted_data.get('reason', change_desc),
-            "triggered_by": uploader_name,
-            "timestamp": timestamp,
-            "doc_id": doc_id,  # Same doc_id as Pinecone
+        supabase.table("history_table").update({
+            "doc_id": doc_id,
             "filename": file.filename,
             "file_type": os.path.splitext(file.filename)[1],
-            "num_chunks": len(text_chunks)
-        }
+            "num_chunks": len(text_chunks),
+            "triggered_by": uploader_name,
+            "reason": change_desc
+        }).eq("version_number", version_number).eq("table_name", table_name).execute()
         
-        supabase.table("history_table").insert(history_record).execute()
-        print(f"   ✅ Logged to history_table (version {new_version}) with doc_id: {doc_id}")
+        print(f"   ✅ History entry updated with doc_id: {doc_id}")
         
         print(f"\n{'='*70}")
         print(f"✅ DOCUMENT PROCESSING COMPLETE")
@@ -490,6 +478,7 @@ async def inject_data(
             "message": "Document uploaded and processed successfully",
             "doc_id": doc_id,
             "uploader_name": uploader_name,
+            "table_name": table_name,
             "filename": file.filename,
             "action": extracted_data['action'],
             "subject": extracted_data['hcp_data'].get('full_name', 'Unknown'),
@@ -498,8 +487,7 @@ async def inject_data(
             "chunks_created": len(text_chunks),
             "text_length": len(extracted_text),
             "timestamp": timestamp,
-            "version_number": new_version,
-            "storage": "target_list + history_table + Pinecone (all linked by doc_id)"
+            "version_number": version_number
         }
     
     except HTTPException:
@@ -519,25 +507,11 @@ async def inject_data(
 
 @router.post("/search")
 async def search_documents(query: str, top_k: int = 5, table_name: str = None):
-    """
-    Search for documents using semantic similarity
-    
-    Args:
-        query: Search query text
-        top_k: Number of results to return (default: 5)
-        table_name: Optional filter by table name
-    
-    Returns:
-        List of matching chunks with scores
-    """
+    """Search for documents using semantic similarity"""
     try:
-        # Generate embedding for search query
         query_embedding = embedding_model.encode([query]).tolist()[0]
-        
-        # Prepare filter if table_name is provided
         filter_dict = {"table_name": {"$eq": table_name}} if table_name else None
         
-        # Search in Pinecone
         results = index.query(
             vector=query_embedding,
             top_k=top_k,
@@ -545,7 +519,6 @@ async def search_documents(query: str, top_k: int = 5, table_name: str = None):
             filter=filter_dict
         )
         
-        # Format results
         matches = []
         for match in results.get("matches", []):
             matches.append({
@@ -572,15 +545,7 @@ async def search_documents(query: str, top_k: int = 5, table_name: str = None):
 
 @router.get("/documents")
 async def list_documents(table_name: str = None):
-    """
-    List all uploaded documents from history_table
-    
-    Args:
-        table_name: Optional filter by table name
-    
-    Returns:
-        List of uploaded documents with their changes
-    """
+    """List all uploaded documents from history_table"""
     try:
         supabase = get_supabase_client()
         
@@ -606,28 +571,17 @@ async def list_documents(table_name: str = None):
 
 @router.get("/documents/{doc_id}")
 async def get_document_details(doc_id: str):
-    """
-    Get complete details about a document
-    Shows: history entry, Pinecone chunks, and what changes were made
-    
-    Args:
-        doc_id: Document ID to retrieve
-    
-    Returns:
-        Complete document information from both Supabase and Pinecone
-    """
+    """Get complete details about a document"""
     supabase = get_supabase_client()
     
     try:
-        # Get history entry from Supabase
         history = supabase.table("history_table").select("*") \
             .eq("doc_id", doc_id) \
             .execute()
         
-        # Get chunks from Pinecone
         try:
             pinecone_results = index.query(
-                vector=[0.0] * 384,  # Dummy vector for metadata retrieval
+                vector=[0.0] * 384,
                 top_k=100,
                 filter={"doc_id": {"$eq": doc_id}},
                 include_metadata=True
@@ -645,7 +599,7 @@ async def get_document_details(doc_id: str):
                     "chunk_id": c["id"],
                     "text_preview": c.get("metadata", {}).get("chunk_text", "")[:200]
                 }
-                for c in chunks[:3]  # Show first 3 chunks
+                for c in chunks[:3]
             ],
             "status": "found" if history.data else "not found"
         }
@@ -654,106 +608,24 @@ async def get_document_details(doc_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/test-extraction")
-async def test_extraction(file: UploadFile = File(...)):
-    """
-    TEST ENDPOINT: Extract and analyze document WITHOUT executing SQL
-    
-    This endpoint helps you verify:
-    1. Text extraction is working
-    2. LLM correctly identifies the action
-    3. LLM extracts HCP data properly
-    4. SQL query is generated correctly
-    
-    Use this to test before running the full upload flow
-    
-    Returns:
-        - Extracted text
-        - LLM extracted data
-        - Generated SQL query
-    """
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
-    
-    try:
-        print(f"\n{'='*70}")
-        print(f"🧪 TEST MODE - SQL Generation Preview")
-        print(f"{'='*70}\n")
-        
-        # Step 1: Extract text
-        print(f"1️⃣  Extracting text from {file.filename}...")
-        extracted_text = extract_text_from_file(tmp_path, file.filename)
-        print(f"   ✅ Extracted {len(extracted_text)} characters\n")
-        
-        # Step 2: Use LLM to extract data
-        print(f"2️⃣  Analyzing with LLM...")
-        extracted_data = extract_entities_with_llm(extracted_text)
-        print(f"   Action: {extracted_data['action']}")
-        print(f"   Subject: {extracted_data['hcp_data'].get('full_name', 'Unknown')}\n")
-        
-        # Step 3: Generate SQL
-        print(f"3️⃣  Generating SQL...")
-        sql = generate_sql_from_document(extracted_data)
-        print(f"   ✅ SQL Generated\n")
-        
-        print(f"{'='*70}\n")
-        
-        return {
-            "status": "test_mode",
-            "message": "Analysis complete - SQL NOT executed",
-            "filename": file.filename,
-            "extracted_text_preview": extracted_text[:500] + "..." if len(extracted_text) > 500 else extracted_text,
-            "extracted_text_length": len(extracted_text),
-            "llm_analysis": {
-                "action": extracted_data['action'],
-                "hcp_data": extracted_data['hcp_data'],
-                "reason": extracted_data.get('reason', ''),
-                "identifier": extracted_data.get('identifier', '')
-            },
-            "generated_sql": sql,
-            "note": "This SQL was NOT executed. Use /injection/upload to execute."
-        }
-    
-    except Exception as e:
-        print(f"❌ Test failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Test failed: {str(e)}")
-    
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-
 @router.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str):
-    """
-    Delete a document and all its chunks from Pinecone and mark in history_table
-    
-    Args:
-        doc_id: Document ID to delete
-    
-    Returns:
-        Success message with deletion details
-    """
+    """Delete a document and all its chunks from Pinecone and mark in history_table"""
     try:
         supabase = get_supabase_client()
         
-        # Find all chunks in Pinecone for this document
         results = index.query(
-            vector=[0] * 384,  # Dummy vector
+            vector=[0] * 384,
             top_k=10000,
             include_metadata=True,
             filter={"doc_id": {"$eq": doc_id}}
         )
         
-        # Delete chunks from Pinecone
         chunk_ids_to_delete = [match["id"] for match in results.get("matches", [])]
         if chunk_ids_to_delete:
             index.delete(ids=chunk_ids_to_delete)
             print(f"✅ Deleted {len(chunk_ids_to_delete)} chunks from Pinecone")
         
-        # Mark as deleted in history_table (add new entry)
         version_resp = supabase.table("history_table").select("version_number") \
             .order("version_number", desc=True) \
             .limit(1) \
